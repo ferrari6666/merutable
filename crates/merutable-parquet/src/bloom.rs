@@ -231,6 +231,7 @@ fn probe_neon_dispatch(data: &[u8], h1: u32, h2: u32, num_probes: u8) -> bool {
 }
 
 #[cfg(not(target_arch = "aarch64"))]
+#[allow(dead_code)]
 fn probe_neon_dispatch(data: &[u8], h1: u32, h2: u32, num_probes: u8) -> bool {
     probe_scalar(data, h1, h2, num_probes)
 }
