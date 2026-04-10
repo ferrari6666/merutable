@@ -86,13 +86,37 @@ impl FastLocalBloom {
     }
 
     /// Deserialize from bytes produced by `to_bytes`.
+    ///
+    /// Rejects corrupted or semantically-invalid inputs:
+    /// - `num_buckets == 0`: an empty bucket table would panic on the
+    ///   first `add`/`may_contain` call because `fast_range32(_, 0) = 0`
+    ///   then slices `data[0..64]` on an empty backing `Vec`.
+    /// - `num_probes == 0`: a zero-probe filter would return `true` for
+    ///   every query (the probe loop runs zero iterations and short-
+    ///   circuits to the terminal `true`), silently disabling the filter
+    ///   and wasting the footer KV bytes.
+    /// - `num_buckets * 64` overflow: checked multiply on 32-bit targets.
     pub fn from_bytes(raw: &[u8]) -> Result<Self> {
         if raw.len() < 5 {
             return Err(MeruError::Corruption("bloom filter bytes too short".into()));
         }
         let num_probes = raw[0];
+        if num_probes == 0 {
+            return Err(MeruError::Corruption(
+                "bloom filter num_probes must be ≥ 1".into(),
+            ));
+        }
         let num_buckets = u32::from_le_bytes(raw[1..5].try_into().unwrap()) as usize;
-        let expected = num_buckets * 64;
+        if num_buckets == 0 {
+            return Err(MeruError::Corruption(
+                "bloom filter num_buckets must be ≥ 1".into(),
+            ));
+        }
+        let expected = num_buckets.checked_mul(64).ok_or_else(|| {
+            MeruError::Corruption(format!(
+                "bloom filter num_buckets {num_buckets} overflows usize when scaled by 64"
+            ))
+        })?;
         if raw.len() - 5 != expected {
             return Err(MeruError::Corruption(format!(
                 "bloom data length mismatch: expected {expected}, got {}",
@@ -264,5 +288,52 @@ mod tests {
         assert_eq!(choose_num_probes(10), 7);
         assert_eq!(choose_num_probes(8), 6);
         assert_eq!(choose_num_probes(12), 8);
+    }
+
+    /// Corruption: a serialized bloom with `num_buckets = 0` would crash
+    /// the first `add`/`may_contain` call by slicing `data[0..64]` on an
+    /// empty backing `Vec`. `from_bytes` must reject it up front.
+    #[test]
+    fn from_bytes_rejects_zero_buckets() {
+        let raw = [7u8, 0, 0, 0, 0]; // num_probes=7, num_buckets=0
+        let result = FastLocalBloom::from_bytes(&raw);
+        assert!(matches!(result, Err(MeruError::Corruption(_))));
+    }
+
+    /// Corruption: `num_probes = 0` would make the probe loop iterate
+    /// zero times and fall through to the terminal `true`, turning every
+    /// query into a false positive and silently disabling the filter.
+    #[test]
+    fn from_bytes_rejects_zero_probes() {
+        // num_probes=0, num_buckets=1, 64 bytes of zeros.
+        let mut raw = vec![0u8, 1, 0, 0, 0];
+        raw.extend(std::iter::repeat_n(0u8, 64));
+        let result = FastLocalBloom::from_bytes(&raw);
+        assert!(matches!(result, Err(MeruError::Corruption(_))));
+    }
+
+    /// Length/field-count mismatches must be rejected cleanly (not
+    /// panic, not silently accept).
+    #[test]
+    fn from_bytes_rejects_length_mismatch() {
+        // Header says num_buckets=2 (→ 128 bytes) but only 64 bytes follow.
+        let mut raw = vec![7u8, 2, 0, 0, 0];
+        raw.extend(std::iter::repeat_n(0u8, 64));
+        let result = FastLocalBloom::from_bytes(&raw);
+        assert!(matches!(result, Err(MeruError::Corruption(_))));
+    }
+
+    /// Serialized round-trip of the minimum legal filter
+    /// (`num_buckets = 1`) must decode and behave correctly end-to-end.
+    #[test]
+    fn round_trip_minimum_size_filter() {
+        // Build the smallest legal bloom (num_keys tiny, floor kicks in).
+        let mut bloom = FastLocalBloom::new(1, 10);
+        bloom.add(b"present");
+        let bytes = bloom.to_bytes();
+        let decoded = FastLocalBloom::from_bytes(&bytes).unwrap();
+        assert!(decoded.may_contain(b"present"));
+        assert_eq!(decoded.num_buckets(), bloom.num_buckets());
+        assert!(decoded.num_buckets() >= 1);
     }
 }
