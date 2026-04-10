@@ -16,9 +16,21 @@ use merutable_types::{
     value::Row,
     MeruError, Result,
 };
-use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
+use parquet::{
+    arrow::ArrowWriter,
+    basic::Compression,
+    file::{
+        properties::WriterProperties,
+        reader::FileReader,
+        serialized_reader::{ReadOptionsBuilder, SerializedFileReader},
+    },
+};
 
-use crate::{bloom::FastLocalBloom, codec};
+use crate::{
+    bloom::FastLocalBloom,
+    codec,
+    kv_index::{self, PageLocation},
+};
 
 /// Assumed average row width in bytes. Used to convert byte budgets into
 /// row counts for `set_max_row_group_size` (which takes rows, not bytes).
@@ -43,12 +55,17 @@ pub fn target_row_group_bytes(level: Level) -> usize {
 
 /// Target data-page **byte** size per LSM level. Same hot→cold rationale
 /// as `target_row_group_bytes`: small pages favor selective reads at L0,
-/// large pages favor scan throughput at L2+.
+/// large pages favor scan throughput at L2+. The schedule is a 4× geometric
+/// progression: each level's page is 4× the previous level's. Cold-tier
+/// at 128 KiB is 8× smaller than the Parquet default of 1 MiB — large
+/// enough that snappy/dictionary compression and I/O amortization both
+/// work, small enough that even cold-tier point lookups don't have to
+/// decompress hundreds of KiB to extract a single row.
 pub fn target_data_page_bytes(level: Level) -> usize {
     match level.0 {
-        0 => 64 * 1024,   // 64 KiB  — hot
-        1 => 256 * 1024,  // 256 KiB — warm
-        _ => 1024 * 1024, // 1 MiB   — cold (parquet default analytics)
+        0 => 8 * 1024,   // 8 KiB   — hot, OS-page-aligned, point-lookup tier
+        1 => 32 * 1024,  // 32 KiB  — warm
+        _ => 128 * 1024, // 128 KiB — cold (analytics-friendly without 1 MiB bloat)
     }
 }
 
@@ -134,57 +151,144 @@ pub fn write_sorted_rows(
     let bloom_bytes = bloom.to_bytes();
     let footer_kv = crate::footer::encode_footer_kv(&meta, &schema)?;
 
-    // Build Parquet KV metadata entries.
-    let mut kv_meta: Vec<parquet::format::KeyValue> = footer_kv
-        .into_iter()
+    // Base KV: file meta + table schema + bloom (no kv_index yet — that
+    // requires knowing page offsets, which only exist after a write).
+    let mut base_kv: Vec<(String, String)> = footer_kv;
+    base_kv.push(("merutable.bloom".to_string(), hex::encode(&bloom_bytes)));
+
+    // Pass 1: write the file with base KV. Pages land at their final byte
+    // offsets in the data section, which is invariant across passes — only
+    // the trailing footer KV changes.
+    let pass1_bytes = arrow_write_pass(&rows, &arrow_schema, &schema, level, &base_kv)?;
+
+    // Inspect pass-1's OffsetIndex to learn page boundaries on the
+    // `_merutable_ikey` column, then build a `(first_key_on_page → location)`
+    // sparse index over those boundaries.
+    let kv_index_entries = extract_kv_index_entries(&rows, &pass1_bytes)?;
+    let kv_index_bytes = kv_index::build(&kv_index_entries, kv_index::DEFAULT_RESTART_INTERVAL);
+
+    // Pass 2: same input, same properties, plus the kv_index footer KV.
+    // Determinism of `ArrowWriter` guarantees identical page layout and
+    // thus identical offsets to those captured in pass 1.
+    let mut full_kv = base_kv;
+    full_kv.push((
+        kv_index::KV_INDEX_FOOTER_KEY.to_string(),
+        hex::encode(&kv_index_bytes),
+    ));
+    let pass2_bytes = arrow_write_pass(&rows, &arrow_schema, &schema, level, &full_kv)?;
+
+    let mut final_meta = meta;
+    final_meta.file_size = pass2_bytes.len() as u64;
+
+    Ok((pass2_bytes, bloom_bytes, final_meta))
+}
+
+/// Single Parquet write of `rows` with the given footer KV. Used twice by
+/// `write_sorted_rows`: first to discover page offsets, then to embed the
+/// `kv_index` that references them.
+///
+/// KV pairs are passed via `WriterProperties::set_key_value_metadata`,
+/// which writes them into the Parquet thrift `FileMetaData.key_value_metadata`
+/// section. (Stuffing them on the Arrow schema metadata does *not* propagate
+/// them to the Parquet footer — that path only round-trips through
+/// `ARROW:schema`, which is opaque to non-Arrow Parquet readers.)
+fn arrow_write_pass(
+    rows: &[(InternalKey, Row)],
+    arrow_schema: &Arc<arrow::datatypes::Schema>,
+    schema: &TableSchema,
+    level: Level,
+    kv: &[(String, String)],
+) -> Result<Vec<u8>> {
+    let kv_meta: Vec<parquet::format::KeyValue> = kv
+        .iter()
         .map(|(k, v)| parquet::format::KeyValue {
-            key: k,
-            value: Some(v),
+            key: k.clone(),
+            value: Some(v.clone()),
         })
         .collect();
-    kv_meta.push(parquet::format::KeyValue {
-        key: "merutable.bloom".to_string(),
-        value: Some(hex::encode(&bloom_bytes)),
-    });
-
-    // Build Arrow schema with metadata.
-    let arrow_schema_with_meta = {
-        let mut metadata = arrow_schema.metadata().clone();
-        for kv in &kv_meta {
-            if let Some(ref v) = kv.value {
-                metadata.insert(kv.key.clone(), v.clone());
-            }
-        }
-        Arc::new(arrow::datatypes::Schema::new_with_metadata(
-            arrow_schema.fields().to_vec(),
-            metadata,
-        ))
-    };
 
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .set_max_row_group_size(target_rows_per_row_group(level))
         .set_data_page_size_limit(target_data_page_bytes(level))
+        .set_key_value_metadata(Some(kv_meta))
         .build();
 
     let buf: Vec<u8> = Vec::new();
-    let mut writer = ArrowWriter::try_new(buf, arrow_schema_with_meta, Some(props))
+    let mut writer = ArrowWriter::try_new(buf, arrow_schema.clone(), Some(props))
         .map_err(|e| MeruError::Parquet(e.to_string()))?;
 
-    // Write rows in batches.
-    let batch = codec::rows_to_record_batch(&rows, &schema)?;
+    let batch = codec::rows_to_record_batch(rows, schema)?;
     writer
         .write(&batch)
         .map_err(|e| MeruError::Parquet(e.to_string()))?;
 
-    let file_bytes: Vec<u8> = writer
+    writer
         .into_inner()
+        .map_err(|e| MeruError::Parquet(e.to_string()))
+}
+
+/// Walk pass-1's `OffsetIndex` for the `_merutable_ikey` column and emit
+/// one `kv_index` entry per data page: the page's first key (full encoded
+/// `InternalKey`) plus its absolute file offset, compressed size, and
+/// global row index.
+///
+/// Global row indices are computed by accumulating the row count of each
+/// preceding row group, since `OffsetIndex.first_row_index` is row-group
+/// local.
+fn extract_kv_index_entries(
+    rows: &[(InternalKey, Row)],
+    pass1_bytes: &[u8],
+) -> Result<Vec<(Vec<u8>, PageLocation)>> {
+    let bytes = Bytes::copy_from_slice(pass1_bytes);
+    let opts = ReadOptionsBuilder::new().with_page_index().build();
+    let reader = SerializedFileReader::new_with_options(bytes, opts)
         .map_err(|e| MeruError::Parquet(e.to_string()))?;
+    let metadata = reader.metadata();
 
-    let mut final_meta = meta;
-    final_meta.file_size = file_bytes.len() as u64;
+    let offset_index = metadata.offset_index().ok_or_else(|| {
+        MeruError::Parquet(
+            "OffsetIndex missing from pass-1 Parquet file (expected ArrowWriter to emit it)".into(),
+        )
+    })?;
 
-    Ok((file_bytes, bloom_bytes, final_meta))
+    // The `_merutable_ikey` column is always column 0 (see `codec::arrow_schema`).
+    const IKEY_COL_IDX: usize = 0;
+
+    let mut entries: Vec<(Vec<u8>, PageLocation)> = Vec::new();
+    let mut row_group_start: u64 = 0;
+
+    for (rg_idx, rg_offset_indexes) in offset_index.iter().enumerate() {
+        let ikey_offsets = rg_offset_indexes.get(IKEY_COL_IDX).ok_or_else(|| {
+            MeruError::Parquet(format!(
+                "OffsetIndex missing _merutable_ikey column for row group {rg_idx}"
+            ))
+        })?;
+
+        for page_loc in ikey_offsets.page_locations() {
+            let global_first_row = row_group_start + page_loc.first_row_index as u64;
+            let row = rows.get(global_first_row as usize).ok_or_else(|| {
+                MeruError::Parquet(format!(
+                    "OffsetIndex first_row_index {global_first_row} \
+                     out of bounds for input row count {}",
+                    rows.len()
+                ))
+            })?;
+            entries.push((
+                row.0.as_bytes().to_vec(),
+                PageLocation {
+                    page_offset: page_loc.offset as u64,
+                    page_size: page_loc.compressed_page_size as u32,
+                    first_row_index: global_first_row,
+                },
+            ));
+        }
+
+        let rg_num_rows = metadata.row_group(rg_idx).num_rows() as u64;
+        row_group_start += rg_num_rows;
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -242,6 +346,8 @@ mod tests {
     /// L0 specifically must stay row-store-sized so flushes are fast and
     /// point lookups are cheap. Anchor the absolute upper bound so that
     /// future "tuning" doesn't drift L0 back into analytics territory.
+    /// The hot-tier page must align to (or be a small multiple of) the
+    /// 4 KiB OS page; we land at exactly 8 KiB.
     #[test]
     fn l0_stays_row_store_sized() {
         assert!(
@@ -249,14 +355,18 @@ mod tests {
             "L0 row group must stay ≤ 8 MiB to behave like a row store"
         );
         assert!(
-            target_data_page_bytes(Level(0)) <= 128 * 1024,
-            "L0 data page must stay ≤ 128 KiB to behave like a row store"
+            target_data_page_bytes(Level(0)) <= 16 * 1024,
+            "L0 data page must stay ≤ 16 KiB to behave like a row store"
         );
     }
 
-    /// L2+ must remain analytics-friendly. Anchor the absolute lower bound
-    /// so a future tweak can't accidentally shrink the cold tier into
-    /// row-store territory.
+    /// L2+ must remain analytics-friendly *enough*: large enough that
+    /// snappy/dictionary compression on composite-PK data has working set,
+    /// I/O is amortized over object-store request overhead, and per-page
+    /// header overhead is negligible. We anchor the floor at 64 KiB —
+    /// well above the compression-effectiveness break-even — and the row
+    /// group floor at 64 MiB. This explicitly forbids regressing back to
+    /// the L0 hot-tier shape.
     #[test]
     fn cold_tier_stays_analytics_sized() {
         assert!(
@@ -264,8 +374,8 @@ mod tests {
             "Cold tier row group must stay ≥ 64 MiB for analytics scans"
         );
         assert!(
-            target_data_page_bytes(Level(2)) >= 512 * 1024,
-            "Cold tier data page must stay ≥ 512 KiB for analytics scans"
+            target_data_page_bytes(Level(2)) >= 64 * 1024,
+            "Cold tier data page must stay ≥ 64 KiB for compression + I/O amortization"
         );
     }
 
@@ -280,5 +390,182 @@ mod tests {
         assert!(r0 >= 1024, "row floor violated: {r0}");
         assert!(r0 < r1, "L0 rows ({r0}) must be < L1 rows ({r1})");
         assert!(r1 < r2, "L1 rows ({r1}) must be < L2 rows ({r2})");
+    }
+
+    // ── kv_index integration tests ──────────────────────────────────────
+
+    use bytes::Bytes as BBytes;
+    use merutable_types::{
+        schema::{ColumnDef, ColumnType, TableSchema},
+        sequence::{OpType, SeqNum},
+        value::{FieldValue, Row},
+    };
+
+    use crate::kv_index::{KvSparseIndex, KV_INDEX_FOOTER_KEY};
+
+    fn kv_index_test_schema() -> TableSchema {
+        TableSchema {
+            table_name: "kv_index_test".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: ColumnType::Int64,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "payload".into(),
+                    col_type: ColumnType::ByteArray,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec![0],
+        }
+    }
+
+    fn make_test_rows(n: usize, schema: &TableSchema) -> Vec<(InternalKey, Row)> {
+        // Per-row unique payload defeats Parquet's dictionary encoding so
+        // that the configured page size limit (8 KiB at L0) is what
+        // actually drives page boundaries — without this, identical
+        // payloads dictionary-compress to a single page.
+        (0..n as i64)
+            .map(|i| {
+                let ikey = InternalKey::encode(
+                    &[FieldValue::Int64(i)],
+                    SeqNum(i as u64 + 1),
+                    OpType::Put,
+                    schema,
+                )
+                .unwrap();
+                // 256-byte payload, unique per row.
+                let mut payload_bytes = vec![0u8; 256];
+                let stamp = i.to_le_bytes();
+                for chunk in payload_bytes.chunks_mut(8) {
+                    let n = chunk.len().min(8);
+                    chunk[..n].copy_from_slice(&stamp[..n]);
+                }
+                let row = Row::new(vec![
+                    Some(FieldValue::Int64(i)),
+                    Some(FieldValue::Bytes(BBytes::from(payload_bytes))),
+                ]);
+                (ikey, row)
+            })
+            .collect()
+    }
+
+    /// Read the `merutable.kv_index.v1` footer KV out of a written file.
+    /// Returns `None` if the writer didn't emit one (which would indicate
+    /// the two-pass integration regressed).
+    fn read_kv_index_from_file(file_bytes: &[u8]) -> Option<KvSparseIndex> {
+        let bytes = BBytes::copy_from_slice(file_bytes);
+        let reader = SerializedFileReader::new(bytes).ok()?;
+        let kv = reader.metadata().file_metadata().key_value_metadata()?;
+        let entry = kv.iter().find(|e| e.key == KV_INDEX_FOOTER_KEY)?;
+        let hex_str = entry.value.as_ref()?;
+        let raw = hex::decode(hex_str).ok()?;
+        KvSparseIndex::from_bytes(BBytes::from(raw)).ok()
+    }
+
+    /// Writer must emit a kv_index footer KV, and decoding it must yield
+    /// at least one entry per data page on the `_merutable_ikey` column.
+    #[test]
+    fn writer_emits_kv_index_in_footer() {
+        let schema = kv_index_test_schema();
+        let rows = make_test_rows(16_384, &schema);
+        let (file_bytes, _bloom, _meta) =
+            write_sorted_rows(rows.clone(), Arc::new(schema), Level(0), 10).unwrap();
+
+        let idx =
+            read_kv_index_from_file(&file_bytes).expect("writer must emit merutable.kv_index.v1");
+        assert!(
+            !idx.is_empty(),
+            "kv_index must contain at least one entry for a non-empty file"
+        );
+        // Multi-page sanity: 16k × 256B payload ≫ 8 KiB page limit so the
+        // _merutable_ikey column must page-split at least a few times.
+        // We deliberately don't assert a tight bound — Parquet's page
+        // sizing is "best effort" based on `write_batch_size` checks and
+        // depends on column compressibility, so we just demand "more
+        // than one page" as the regression guard.
+        assert!(
+            idx.len() >= 2,
+            "expected ≥2 page entries for 16k rows at L0; got {}",
+            idx.len()
+        );
+    }
+
+    /// Every input row's encoded `InternalKey` must resolve via the
+    /// kv_index to a page whose first key is ≤ the probe — i.e., the
+    /// predecessor-search invariant holds against the actual written
+    /// page boundaries. The `first_row_index` must also fall within the
+    /// input row count.
+    #[test]
+    fn kv_index_predecessor_holds_for_every_input_key() {
+        let schema = kv_index_test_schema();
+        let rows = make_test_rows(16_384, &schema);
+        let (file_bytes, _bloom, _meta) =
+            write_sorted_rows(rows.clone(), Arc::new(schema), Level(0), 10).unwrap();
+
+        let idx = read_kv_index_from_file(&file_bytes).unwrap();
+
+        // Collect entries to verify each probe lands on a real page entry.
+        let entries: Vec<_> = idx.iter().collect();
+        assert!(!entries.is_empty());
+
+        for (row_idx, (ikey, _)) in rows.iter().enumerate() {
+            let probe = ikey.as_bytes();
+            let loc = idx.find_page(probe).unwrap_or_else(|| {
+                panic!("kv_index find_page returned None for input row {row_idx}")
+            });
+            assert!(
+                (loc.first_row_index as usize) <= row_idx,
+                "page first_row_index {} must be ≤ probe row {}",
+                loc.first_row_index,
+                row_idx
+            );
+            assert!(
+                (loc.first_row_index as usize) < rows.len(),
+                "page first_row_index {} out of bounds for row count {}",
+                loc.first_row_index,
+                rows.len()
+            );
+        }
+    }
+
+    /// `kv_index` entries must be in strictly ascending key order — that's
+    /// the invariant the binary search and prefix coding both rely on.
+    /// Pages on a sorted `_merutable_ikey` column should naturally satisfy
+    /// this; this test pins the contract so a future writer change can't
+    /// silently break the sort assumption.
+    #[test]
+    fn kv_index_entries_are_strictly_ascending() {
+        let schema = kv_index_test_schema();
+        let rows = make_test_rows(1500, &schema);
+        let (file_bytes, _bloom, _meta) =
+            write_sorted_rows(rows, Arc::new(schema), Level(0), 10).unwrap();
+
+        let idx = read_kv_index_from_file(&file_bytes).unwrap();
+        let mut prev: Option<Vec<u8>> = None;
+        for (k, _) in idx.iter() {
+            if let Some(ref p) = prev {
+                assert!(
+                    k.as_slice() > p.as_slice(),
+                    "kv_index entries not strictly ascending: {p:?} ≮ {k:?}"
+                );
+            }
+            prev = Some(k);
+        }
+    }
+
+    /// The empty-input fast path must NOT emit a kv_index entry — there
+    /// are no pages to index, and the writer short-circuits before any
+    /// Parquet bytes are produced.
+    #[test]
+    fn empty_input_emits_no_kv_index() {
+        let schema = kv_index_test_schema();
+        let (file_bytes, _bloom, _meta) =
+            write_sorted_rows(vec![], Arc::new(schema), Level(0), 10).unwrap();
+        assert!(file_bytes.is_empty());
+        // Nothing to read; just confirm we don't crash trying.
+        assert!(read_kv_index_from_file(&file_bytes).is_none());
     }
 }
