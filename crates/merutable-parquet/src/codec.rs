@@ -15,7 +15,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float32Array, Float64Array,
+    Int32Array, Int64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -92,7 +93,6 @@ pub fn rows_to_record_batch(
     if rows.is_empty() {
         return Ok(RecordBatch::new_empty(arrow_sch));
     }
-    let n = rows.len();
 
     // Build _merutable_ikey column.
     let ikey_col: ArrayRef = Arc::new(BinaryArray::from_iter_values(
@@ -117,94 +117,152 @@ pub fn rows_to_record_batch(
 
     // Typed user columns, in schema order.
     for (col_idx, col_def) in schema.columns.iter().enumerate() {
-        let arr = build_column(rows, col_idx, &col_def.col_type, n)?;
+        let arr = build_column(rows, col_idx, &col_def.col_type)?;
         col_arrays.push(arr);
     }
 
     RecordBatch::try_new(arrow_sch, col_arrays).map_err(|e| MeruError::Parquet(e.to_string()))
 }
 
+/// Build one Arrow column from the `col_idx`-th field of every row.
+///
+/// # Type-mismatch policy
+///
+/// If a row contains a `FieldValue` variant that doesn't match `col_type`
+/// this returns `MeruError::Parquet` with the row index and expected /
+/// actual variant names. Previously the writer silently coerced
+/// mismatches to `0` / `false` / empty bytes, which produced a valid
+/// Parquet file containing garbage values — a silent data-corruption
+/// bug that survived every round-trip test (which uses correct types).
 fn build_column(
     rows: &[(InternalKey, Row)],
     col_idx: usize,
     col_type: &ColumnType,
-    _n: usize,
 ) -> Result<ArrayRef> {
+    /// Shorthand for "type mismatch at row `i`, expected X, got Y".
+    fn mismatch(col_idx: usize, row_idx: usize, expected: &str, got: &FieldValue) -> MeruError {
+        MeruError::Parquet(format!(
+            "codec::build_column: type mismatch at column {col_idx} row {row_idx}: \
+             expected {expected}, got {}",
+            field_variant_name(got)
+        ))
+    }
+
     match col_type {
         ColumnType::Boolean => {
-            let vals: Vec<Option<bool>> = rows
-                .iter()
-                .map(|(_, row)| {
-                    row.get(col_idx).map(|v| match v {
-                        FieldValue::Boolean(b) => *b,
-                        _ => false,
-                    })
-                })
-                .collect();
+            let mut vals: Vec<Option<bool>> = Vec::with_capacity(rows.len());
+            for (row_idx, (_, row)) in rows.iter().enumerate() {
+                match row.get(col_idx) {
+                    None => vals.push(None),
+                    Some(FieldValue::Boolean(b)) => vals.push(Some(*b)),
+                    Some(other) => return Err(mismatch(col_idx, row_idx, "Boolean", other)),
+                }
+            }
             Ok(Arc::new(BooleanArray::from(vals)))
         }
         ColumnType::Int32 => {
-            let vals: Vec<Option<i32>> = rows
-                .iter()
-                .map(|(_, row)| {
-                    row.get(col_idx).map(|v| match v {
-                        FieldValue::Int32(i) => *i,
-                        _ => 0,
-                    })
-                })
-                .collect();
+            let mut vals: Vec<Option<i32>> = Vec::with_capacity(rows.len());
+            for (row_idx, (_, row)) in rows.iter().enumerate() {
+                match row.get(col_idx) {
+                    None => vals.push(None),
+                    Some(FieldValue::Int32(i)) => vals.push(Some(*i)),
+                    Some(other) => return Err(mismatch(col_idx, row_idx, "Int32", other)),
+                }
+            }
             Ok(Arc::new(Int32Array::from(vals)))
         }
         ColumnType::Int64 => {
-            let vals: Vec<Option<i64>> = rows
-                .iter()
-                .map(|(_, row)| {
-                    row.get(col_idx).map(|v| match v {
-                        FieldValue::Int64(i) => *i,
-                        _ => 0,
-                    })
-                })
-                .collect();
+            let mut vals: Vec<Option<i64>> = Vec::with_capacity(rows.len());
+            for (row_idx, (_, row)) in rows.iter().enumerate() {
+                match row.get(col_idx) {
+                    None => vals.push(None),
+                    Some(FieldValue::Int64(i)) => vals.push(Some(*i)),
+                    Some(other) => return Err(mismatch(col_idx, row_idx, "Int64", other)),
+                }
+            }
             Ok(Arc::new(Int64Array::from(vals)))
         }
         ColumnType::Float => {
-            let vals: Vec<Option<f32>> = rows
-                .iter()
-                .map(|(_, row)| {
-                    row.get(col_idx).map(|v| match v {
-                        FieldValue::Float(f) => *f,
-                        _ => 0.0,
-                    })
-                })
-                .collect();
+            let mut vals: Vec<Option<f32>> = Vec::with_capacity(rows.len());
+            for (row_idx, (_, row)) in rows.iter().enumerate() {
+                match row.get(col_idx) {
+                    None => vals.push(None),
+                    Some(FieldValue::Float(f)) => vals.push(Some(*f)),
+                    Some(other) => return Err(mismatch(col_idx, row_idx, "Float", other)),
+                }
+            }
             Ok(Arc::new(Float32Array::from(vals)))
         }
         ColumnType::Double => {
-            let vals: Vec<Option<f64>> = rows
-                .iter()
-                .map(|(_, row)| {
-                    row.get(col_idx).map(|v| match v {
-                        FieldValue::Double(d) => *d,
-                        _ => 0.0,
-                    })
-                })
-                .collect();
+            let mut vals: Vec<Option<f64>> = Vec::with_capacity(rows.len());
+            for (row_idx, (_, row)) in rows.iter().enumerate() {
+                match row.get(col_idx) {
+                    None => vals.push(None),
+                    Some(FieldValue::Double(d)) => vals.push(Some(*d)),
+                    Some(other) => return Err(mismatch(col_idx, row_idx, "Double", other)),
+                }
+            }
             Ok(Arc::new(Float64Array::from(vals)))
         }
-        ColumnType::ByteArray | ColumnType::FixedLenByteArray(_) => {
-            let vals: Vec<Option<&[u8]>> = rows
-                .iter()
-                .map(|(_, row)| {
-                    row.get(col_idx).map(|v| match v {
-                        FieldValue::Bytes(b) => b.as_ref(),
-                        _ => &[],
-                    })
-                })
-                .collect();
-            // Use BinaryArray for both variable and fixed-length in Arrow.
-            let arr = BinaryArray::from_iter(vals);
+        ColumnType::ByteArray => {
+            let mut vals: Vec<Option<&[u8]>> = Vec::with_capacity(rows.len());
+            for (row_idx, (_, row)) in rows.iter().enumerate() {
+                match row.get(col_idx) {
+                    None => vals.push(None),
+                    Some(FieldValue::Bytes(b)) => vals.push(Some(b.as_ref())),
+                    Some(other) => return Err(mismatch(col_idx, row_idx, "Bytes", other)),
+                }
+            }
+            Ok(Arc::new(BinaryArray::from_iter(vals)))
+        }
+        ColumnType::FixedLenByteArray(n) => {
+            // Every non-null row at this column must be exactly `n` bytes.
+            // The Arrow schema (see `arrow_schema`) declares this column
+            // as `FixedSizeBinary(n)`, so the `ArrayRef` we produce here
+            // must be a `FixedSizeBinaryArray` of the same width —
+            // otherwise `RecordBatch::try_new` would reject the batch.
+            let expected_len = *n as usize;
+            let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(rows.len());
+            for (row_idx, (_, row)) in rows.iter().enumerate() {
+                match row.get(col_idx) {
+                    None => vals.push(None),
+                    Some(FieldValue::Bytes(b)) => {
+                        if b.len() != expected_len {
+                            return Err(MeruError::Parquet(format!(
+                                "codec::build_column: FixedLenByteArray({expected_len}) at column \
+                                 {col_idx} row {row_idx} has wrong length {} (expected {expected_len})",
+                                b.len()
+                            )));
+                        }
+                        vals.push(Some(b.to_vec()));
+                    }
+                    Some(other) => return Err(mismatch(col_idx, row_idx, "Bytes", other)),
+                }
+            }
+            let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                vals.into_iter(),
+                *n,
+            )
+            .map_err(|e| {
+                MeruError::Parquet(format!(
+                    "codec::build_column: FixedSizeBinaryArray::try_from_sparse_iter_with_size({n}): {e}"
+                ))
+            })?;
             Ok(Arc::new(arr))
         }
+    }
+}
+
+/// Name of a `FieldValue` variant, for error messages. Kept in sync
+/// with [`FieldValue`] by construction.
+fn field_variant_name(v: &FieldValue) -> &'static str {
+    match v {
+        FieldValue::Boolean(_) => "Boolean",
+        FieldValue::Int32(_) => "Int32",
+        FieldValue::Int64(_) => "Int64",
+        FieldValue::Float(_) => "Float",
+        FieldValue::Double(_) => "Double",
+        FieldValue::Bytes(_) => "Bytes",
     }
 }
 
@@ -288,6 +346,12 @@ pub fn record_batch_to_rows(
     Ok(result)
 }
 
+/// Extract one `FieldValue` from an Arrow array cell. Returns an error
+/// (rather than panicking) on downcast mismatch — this can happen when
+/// a Parquet file's physical column type drifted away from the table
+/// schema it's being decoded against, e.g. after a schema-evolution
+/// rename or a corrupted footer. Panicking in that path would take down
+/// the read path on a diagnosable condition.
 fn extract_field(
     arr: &dyn arrow::array::Array,
     row: usize,
@@ -296,31 +360,280 @@ fn extract_field(
     if arr.is_null(row) {
         return Ok(None);
     }
+
+    fn downcast_err(expected: &str, actual: &arrow::datatypes::DataType) -> MeruError {
+        MeruError::Parquet(format!(
+            "codec::extract_field: Arrow array type mismatch — expected {expected}, got {actual:?}"
+        ))
+    }
+
     let val = match col_type {
         ColumnType::Boolean => {
-            let a = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+            let a = arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| downcast_err("BooleanArray", arr.data_type()))?;
             FieldValue::Boolean(a.value(row))
         }
         ColumnType::Int32 => {
-            let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+            let a = arr
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| downcast_err("Int32Array", arr.data_type()))?;
             FieldValue::Int32(a.value(row))
         }
         ColumnType::Int64 => {
-            let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+            let a = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| downcast_err("Int64Array", arr.data_type()))?;
             FieldValue::Int64(a.value(row))
         }
         ColumnType::Float => {
-            let a = arr.as_any().downcast_ref::<Float32Array>().unwrap();
+            let a = arr
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| downcast_err("Float32Array", arr.data_type()))?;
             FieldValue::Float(a.value(row))
         }
         ColumnType::Double => {
-            let a = arr.as_any().downcast_ref::<Float64Array>().unwrap();
+            let a = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| downcast_err("Float64Array", arr.data_type()))?;
             FieldValue::Double(a.value(row))
         }
-        ColumnType::ByteArray | ColumnType::FixedLenByteArray(_) => {
-            let a = arr.as_any().downcast_ref::<BinaryArray>().unwrap();
+        ColumnType::ByteArray => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| downcast_err("BinaryArray", arr.data_type()))?;
+            FieldValue::Bytes(Bytes::copy_from_slice(a.value(row)))
+        }
+        ColumnType::FixedLenByteArray(_) => {
+            // The Arrow schema declares this as `FixedSizeBinary(n)` (see
+            // `column_type_to_arrow`) and `build_column` constructs a
+            // `FixedSizeBinaryArray`. Decode must downcast to the same
+            // type — previously this arm shared `BinaryArray` with
+            // `ByteArray` and would panic/error on FixedSizeBinary input.
+            let a = arr
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| downcast_err("FixedSizeBinaryArray", arr.data_type()))?;
             FieldValue::Bytes(Bytes::copy_from_slice(a.value(row)))
         }
     };
     Ok(Some(val))
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use merutable_types::{
+        key::InternalKey,
+        schema::{ColumnDef, ColumnType, TableSchema},
+        sequence::{OpType, SeqNum},
+    };
+
+    fn scalar_schema() -> TableSchema {
+        TableSchema {
+            table_name: "t".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: ColumnType::Int64,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "flag".into(),
+                    col_type: ColumnType::Boolean,
+                    nullable: true,
+                },
+                ColumnDef {
+                    name: "score".into(),
+                    col_type: ColumnType::Double,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec![0],
+        }
+    }
+
+    fn make_ikey(id: i64, seq: u64, schema: &TableSchema) -> InternalKey {
+        InternalKey::encode(&[FieldValue::Int64(id)], SeqNum(seq), OpType::Put, schema).unwrap()
+    }
+
+    /// Round-trip a small set through `rows_to_record_batch` →
+    /// `record_batch_to_rows` at L1 (typed-only, no blob fast path).
+    /// This pins the happy-path field-for-field equality contract.
+    #[test]
+    fn l1_roundtrip_typed_columns_match_input() {
+        let schema = scalar_schema();
+        let rows: Vec<(InternalKey, Row)> = (1..=5i64)
+            .map(|i| {
+                (
+                    make_ikey(i, i as u64, &schema),
+                    Row::new(vec![
+                        Some(FieldValue::Int64(i)),
+                        if i % 2 == 0 {
+                            Some(FieldValue::Boolean(true))
+                        } else {
+                            None
+                        },
+                        Some(FieldValue::Double(i as f64 * 1.5)),
+                    ]),
+                )
+            })
+            .collect();
+
+        let batch = rows_to_record_batch(&rows, &schema, Level(1)).unwrap();
+        let decoded = record_batch_to_rows(&batch, &schema).unwrap();
+        assert_eq!(decoded.len(), rows.len());
+        for ((orig_ik, orig_row), (got_ik, got_row)) in rows.iter().zip(decoded.iter()) {
+            assert_eq!(orig_ik.as_bytes(), got_ik.as_bytes());
+            assert_eq!(orig_row, got_row);
+        }
+    }
+
+    /// Silent-coercion regression: passing a row whose `FieldValue`
+    /// variant doesn't match the schema's `ColumnType` used to store
+    /// `0` / `false` / empty bytes in the Parquet file without any
+    /// warning. It must now error with a precise row + column index.
+    #[test]
+    fn build_column_rejects_type_mismatch_int32_vs_int64() {
+        let schema = TableSchema {
+            table_name: "t".into(),
+            columns: vec![ColumnDef {
+                name: "n".into(),
+                col_type: ColumnType::Int32,
+                nullable: false,
+            }],
+            primary_key: vec![0],
+        };
+        let ikey =
+            InternalKey::encode(&[FieldValue::Int32(1)], SeqNum(1), OpType::Put, &schema).unwrap();
+        // Schema says Int32 but we hand it an Int64 — classic drift.
+        let rows = vec![(ikey, Row::new(vec![Some(FieldValue::Int64(0x1_0000_0000))]))];
+        let err = rows_to_record_batch(&rows, &schema, Level(1)).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("type mismatch") && msg.contains("Int32") && msg.contains("Int64"),
+            "error should name expected + actual variants: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_column_rejects_type_mismatch_bytes_vs_bool() {
+        let schema = TableSchema {
+            table_name: "t".into(),
+            columns: vec![ColumnDef {
+                name: "flag".into(),
+                col_type: ColumnType::Boolean,
+                nullable: false,
+            }],
+            primary_key: vec![],
+        };
+        let ikey = InternalKey::encode(&[], SeqNum(1), OpType::Put, &schema).unwrap();
+        let rows = vec![(
+            ikey,
+            Row::new(vec![Some(FieldValue::Bytes(Bytes::from("nope")))]),
+        )];
+        let err = rows_to_record_batch(&rows, &schema, Level(1)).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("Boolean") && msg.contains("Bytes"), "{msg}");
+    }
+
+    /// FixedLenByteArray(n) now validates length at write time. Previously
+    /// the declared length was completely ignored and any bytes were
+    /// accepted, silently breaking the schema contract downstream.
+    #[test]
+    fn fixed_len_byte_array_rejects_wrong_length() {
+        let schema = TableSchema {
+            table_name: "t".into(),
+            columns: vec![ColumnDef {
+                name: "fb".into(),
+                col_type: ColumnType::FixedLenByteArray(4),
+                nullable: false,
+            }],
+            primary_key: vec![],
+        };
+        let ikey = InternalKey::encode(&[], SeqNum(1), OpType::Put, &schema).unwrap();
+        let rows = vec![(
+            ikey,
+            Row::new(vec![Some(FieldValue::Bytes(Bytes::from("too_long_bytes")))]),
+        )];
+        let err = rows_to_record_batch(&rows, &schema, Level(1)).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("FixedLenByteArray") && msg.contains("wrong length"),
+            "{msg}"
+        );
+    }
+
+    /// FixedLenByteArray(n) accepts exactly-n-byte values.
+    #[test]
+    fn fixed_len_byte_array_accepts_correct_length() {
+        let schema = TableSchema {
+            table_name: "t".into(),
+            columns: vec![ColumnDef {
+                name: "fb".into(),
+                col_type: ColumnType::FixedLenByteArray(4),
+                nullable: false,
+            }],
+            primary_key: vec![],
+        };
+        let ikey = InternalKey::encode(&[], SeqNum(1), OpType::Put, &schema).unwrap();
+        let rows = vec![(
+            ikey,
+            Row::new(vec![Some(FieldValue::Bytes(Bytes::from("abcd")))]),
+        )];
+        let batch = rows_to_record_batch(&rows, &schema, Level(1)).unwrap();
+        let decoded = record_batch_to_rows(&batch, &schema).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].1, rows[0].1);
+    }
+
+    /// Null fields at nullable columns must round-trip as `None`.
+    #[test]
+    fn null_fields_round_trip_as_none() {
+        let schema = scalar_schema();
+        let ikey = make_ikey(42, 1, &schema);
+        let row = Row::new(vec![
+            Some(FieldValue::Int64(42)),
+            None, // flag is nullable
+            Some(FieldValue::Double(123.456)),
+        ]);
+        let batch = rows_to_record_batch(&[(ikey, row.clone())], &schema, Level(1)).unwrap();
+        let decoded = record_batch_to_rows(&batch, &schema).unwrap();
+        assert_eq!(decoded[0].1, row);
+        assert_eq!(decoded[0].1.get(1), None);
+    }
+
+    /// Empty-input batches must not round-trip via the typed decode
+    /// path (they early-return an empty Vec). This pins the zero-row
+    /// fast path so a future refactor can't accidentally dereference a
+    /// non-existent ikey column on an empty batch.
+    #[test]
+    fn empty_batch_decodes_to_empty_vec() {
+        let schema = scalar_schema();
+        let batch = rows_to_record_batch(&[], &schema, Level(1)).unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        let decoded = record_batch_to_rows(&batch, &schema).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    /// An Arrow array whose physical type disagrees with the declared
+    /// `ColumnType` must produce a `MeruError::Parquet` instead of
+    /// panicking. Previously `downcast_ref().unwrap()` would take down
+    /// the read path on a diagnosable condition.
+    #[test]
+    fn extract_field_returns_error_on_downcast_mismatch() {
+        // Hand-build a Float64Array and ask `extract_field` to decode
+        // it as Int64 — type mismatch must surface as Err, not panic.
+        let arr = arrow::array::Float64Array::from(vec![1.5_f64]);
+        let result = extract_field(&arr, 0, &ColumnType::Int64);
+        assert!(matches!(result, Err(MeruError::Parquet(_))));
+    }
 }
