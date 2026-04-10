@@ -150,76 +150,21 @@ fn probe_scalar(data: &[u8], h1: u32, h2: u32, num_probes: u8) -> bool {
 }
 
 // ── AVX2 probe ────────────────────────────────────────────────────────────────
+//
+// Phase 10 (SIMD optimization pass) will replace this with a real AVX2 probe
+// using `_mm256_*` intrinsics. For now we delegate to the scalar implementation
+// so that the dispatch infrastructure (runtime detection + fn pointer) is in
+// place without depending on a working SIMD body.
 
 #[cfg(target_arch = "x86_64")]
 fn probe_avx2_dispatch(data: &[u8], h1: u32, h2: u32, num_probes: u8) -> bool {
-    // SAFETY: We only dispatch here when is_x86_feature_detected!("avx2") was true
-    // at startup (checked in PROBE_FN initialization). The data slice is valid.
-    if num_probes <= 8 {
-        unsafe { probe_avx2_8(data, h1, h2, num_probes) }
-    } else {
-        // Fall back to scalar for > 8 probes (rare with typical bits/key settings).
-        probe_scalar(data, h1, h2, num_probes)
-    }
+    probe_scalar(data, h1, h2, num_probes)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(dead_code)]
 fn probe_avx2_dispatch(data: &[u8], h1: u32, h2: u32, num_probes: u8) -> bool {
     probe_scalar(data, h1, h2, num_probes)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn probe_avx2_8(data: &[u8], h1: u32, h2: u32, num_probes: u8) -> bool {
-    use std::arch::x86_64::*;
-
-    // Precomputed golden ratio powers: 0x9e3779b9^k for k=1..8
-    const MULTIPLIERS: [u32; 8] = [
-        0x9e3779b9, 0x3c6ef372, 0xdaa66d2b, 0x78dde6e4, 0x1715609d, 0xb54cda56, 0x5384540f,
-        0xf1bbcdc8,
-    ];
-
-    let num_buckets = (data.len() / 64) as u32;
-    let bucket_idx = fast_range32(h1, num_buckets);
-    let line_ptr = data[bucket_idx * 64..].as_ptr();
-
-    // Load the 512-bit bucket as two 256-bit halves.
-    let lo = _mm256_loadu_si256(line_ptr as *const __m256i);
-    let hi = _mm256_loadu_si256(line_ptr.add(32) as *const __m256i);
-
-    // Broadcast h2 across 8 lanes.
-    let h2_vec = _mm256_set1_epi32(h2 as i32);
-
-    // Compute 8 mixed hashes simultaneously.
-    let mult_vec = _mm256_loadu_si256(MULTIPLIERS.as_ptr() as *const __m256i);
-    let mixed = _mm256_mullo_epi32(h2_vec, mult_vec);
-
-    // Extract bit positions: (h >> 23) & 511 for each lane.
-    let shift23 = _mm256_srli_epi32(mixed, 23);
-    let mask511 = _mm256_set1_epi32(511);
-    let bit_pos_vec = _mm256_and_si256(shift23, mask511);
-
-    // For each bit position, check if the corresponding bit is set in the 512-bit bucket.
-    // We process up to num_probes lanes; remaining lanes are ignored.
-    let mut all_set = true;
-    for i in 0..(num_probes as usize) {
-        let bit_pos = _mm256_extract_epi32(bit_pos_vec, 0) as usize;
-        // Rotate to get next lane (workaround for variable-index extract in stable intrinsics).
-        // This is a simplified implementation; production would use permute.
-        let _ = i; // lane index handled by the loop below via scalar extraction
-        let byte_idx = bit_pos >> 3;
-        let bit_idx = bit_pos & 7;
-        // Access directly: bucket is within data slice.
-        let bucket_base = bucket_idx * 64;
-        if data[bucket_base + byte_idx] & (1u8 << bit_idx) == 0 {
-            all_set = false;
-            break;
-        }
-    }
-    // Suppress unused variable warnings for SIMD registers in this simplified impl.
-    let _ = (lo, hi, bit_pos_vec, mult_vec, mask511, shift23);
-    all_set
 }
 
 // ── NEON probe ────────────────────────────────────────────────────────────────
