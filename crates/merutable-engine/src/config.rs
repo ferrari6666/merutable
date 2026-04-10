@@ -1,0 +1,71 @@
+use merutable_types::schema::TableSchema;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// All tuning parameters for a `MeruEngine` instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineConfig {
+    pub schema: TableSchema,
+    pub catalog_uri: String,
+    pub object_store_prefix: String,
+    pub wal_dir: PathBuf,
+
+    // Memtable
+    /// Flush threshold in bytes. Default: 64 MiB.
+    pub memtable_size_bytes: usize,
+    /// Max number of immutable memtables before write stall. Default: 4.
+    pub max_immutable_count: usize,
+
+    // Compaction
+    /// Target bytes per level for L1..LN. Index 0 = L1 target.
+    /// Default: [256 MiB, 2 GiB, 16 GiB, 128 GiB].
+    pub level_target_bytes: Vec<u64>,
+    /// Number of L0 files that triggers a compaction. Default: 4.
+    pub l0_compaction_trigger: usize,
+    /// Number of L0 files that slows writes (1 ms sleep per write). Default: 20.
+    pub l0_slowdown_trigger: usize,
+    /// Number of L0 files that stops writes entirely. Default: 36.
+    pub l0_stop_trigger: usize,
+
+    // Bloom filter
+    /// Bits per key for the Parquet-column bloom filter. Default: 10.
+    pub bloom_bits_per_key: u8,
+
+    // Compaction I/O
+    /// Max bytes written per compaction run before splitting output files. Default: 256 MiB.
+    pub max_compaction_bytes: u64,
+
+    // Background parallelism
+    pub flush_parallelism: usize,
+    pub compaction_parallelism: usize,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            schema: TableSchema {
+                table_name: String::new(),
+                columns: vec![],
+                primary_key: vec![],
+            },
+            catalog_uri: String::new(),
+            object_store_prefix: String::new(),
+            wal_dir: PathBuf::from("./meru-wal"),
+            memtable_size_bytes: 64 * 1024 * 1024,
+            max_immutable_count: 4,
+            level_target_bytes: vec![
+                256 * 1024 * 1024,
+                2 * 1024 * 1024 * 1024,
+                16 * 1024 * 1024 * 1024,
+                128 * 1024 * 1024 * 1024,
+            ],
+            l0_compaction_trigger: 4,
+            l0_slowdown_trigger: 20,
+            l0_stop_trigger: 36,
+            bloom_bits_per_key: 10,
+            max_compaction_bytes: 256 * 1024 * 1024,
+            flush_parallelism: 1,
+            compaction_parallelism: 2,
+        }
+    }
+}

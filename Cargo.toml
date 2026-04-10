@@ -1,0 +1,79 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/merutable-types",
+    "crates/merutable-wal",
+    "crates/merutable-memtable",
+    "crates/merutable-parquet",
+    "crates/merutable-iceberg",
+    "crates/merutable-store",
+    "crates/merutable-engine",
+    "crates/merutable",
+]
+
+[workspace.dependencies]
+# Internal crates
+merutable-types    = { path = "crates/merutable-types" }
+merutable-wal      = { path = "crates/merutable-wal" }
+merutable-memtable = { path = "crates/merutable-memtable" }
+merutable-parquet  = { path = "crates/merutable-parquet" }
+merutable-iceberg  = { path = "crates/merutable-iceberg" }
+merutable-store    = { path = "crates/merutable-store" }
+merutable-engine   = { path = "crates/merutable-engine" }
+
+# Parquet / Arrow (arrow-rs monorepo)
+parquet      = { version = "53", features = ["async"] }
+arrow        = { version = "53" }
+arrow-array  = { version = "53" }
+arrow-schema = { version = "53" }
+
+# Iceberg
+iceberg = { version = "0.4" }
+
+# Object store
+object_store = { version = "0.11", features = ["aws"] }
+
+# Async runtime
+tokio        = { version = "1", features = ["full"] }
+futures      = { version = "0.3" }
+async-trait  = { version = "0.1" }
+
+# Data structures
+crossbeam-skiplist = { version = "0.1" }
+bumpalo            = { version = "3" }
+arc-swap           = { version = "1" }
+lru                = { version = "0.12" }
+roaring            = { version = "0.10" }
+
+# Bytes / encoding
+bytes       = { version = "1", features = ["serde"] }
+crc32fast   = { version = "1" }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+blake3      = { version = "1" }
+uuid        = { version = "1", features = ["v4"] }
+
+# Observability
+tracing = { version = "0.1" }
+
+# Error handling / serde
+thiserror  = { version = "2" }
+serde      = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+
+# One-time init
+once_cell = { version = "1" }
+hex       = { version = "0.4" }
+
+# Testing
+proptest = { version = "1" }
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile  = { version = "3" }
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+opt-level     = 3
+
+[profile.bench]
+inherits = "release"
+debug    = true

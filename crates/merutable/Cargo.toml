@@ -1,0 +1,21 @@
+[package]
+name    = "merutable"
+version = "0.1.0"
+edition = "2021"
+description = "Embeddable HTAP database: LSM-tree over Apache Iceberg and Parquet"
+keywords    = ["database", "lsm", "iceberg", "parquet", "htap"]
+license     = "Apache-2.0"
+
+[dependencies]
+merutable-types  = { workspace = true }
+merutable-engine = { workspace = true }
+tokio            = { workspace = true }
+futures          = { workspace = true }
+tracing          = { workspace = true }
+serde            = { workspace = true }
+bytes            = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["full"] }
+tracing-subscriber = "0.3"

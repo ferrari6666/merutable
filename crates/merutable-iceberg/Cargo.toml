@@ -1,0 +1,25 @@
+[package]
+name    = "merutable-iceberg"
+version = "0.1.0"
+edition = "2021"
+description = "Iceberg v3 manifest layer, deletion vectors (Puffin), and version management for merutable"
+
+[dependencies]
+merutable-types   = { workspace = true }
+merutable-parquet = { workspace = true }
+iceberg           = { workspace = true }
+roaring           = { workspace = true }
+bytes             = { workspace = true }
+tokio             = { workspace = true }
+object_store      = { workspace = true }
+tracing           = { workspace = true }
+thiserror         = { workspace = true }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+arc-swap          = { workspace = true }
+uuid              = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["full"] }
