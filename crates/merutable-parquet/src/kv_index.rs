@@ -306,12 +306,32 @@ impl KvSparseIndex {
         HEADER_SIZE + self.entries_size + 4 * self.restart_offsets.len()
     }
 
+    /// Like [`find_page`] but also returns the `first_row_index` of the
+    /// *next* entry in the index — or `None` if the matched entry was the
+    /// last one. Callers need this to bound the matched page's row count
+    /// when issuing a Parquet `RowSelection`: the page contains rows
+    /// `[matched.first_row_index, next_first_row_index)`, clamped to the
+    /// matched page's enclosing row group (which the caller does using
+    /// file metadata).
+    ///
+    /// This is the integration point with the Parquet reader's
+    /// page-skipping point-lookup path.
+    ///
+    /// [`find_page`]: KvSparseIndex::find_page
+    pub fn find_page_with_next(&self, target: &[u8]) -> Option<(PageLocation, Option<u64>)> {
+        self.find_page_inner(target)
+    }
+
     /// Find the page that contains the largest key ≤ `target`.
     ///
     /// Returns `None` if the target is strictly less than every key in the
     /// index — i.e., the target precedes the file's smallest key, so the
     /// file cannot contain it.
     pub fn find_page(&self, target: &[u8]) -> Option<PageLocation> {
+        self.find_page_inner(target).map(|(loc, _)| loc)
+    }
+
+    fn find_page_inner(&self, target: &[u8]) -> Option<(PageLocation, Option<u64>)> {
         if self.num_entries == 0 {
             return None;
         }
@@ -344,6 +364,7 @@ impl KvSparseIndex {
         let mut cursor = scan_start_pos;
         let mut prev_key: Vec<u8> = Vec::new();
         let mut best: Option<PageLocation> = None;
+        let mut next_first_row: Option<u64> = None;
 
         // We may scan beyond `restart_interval` entries when lo == -1, but
         // in that case we still bail out at the next restart (whose key is
@@ -355,7 +376,14 @@ impl KvSparseIndex {
             let (entry_key, loc, next_cursor) = self.decode_entry_at(cursor, &prev_key);
 
             match entry_key.as_slice().cmp(target) {
-                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Greater => {
+                    // First entry strictly greater than target — its
+                    // first_row_index bounds the matched page's row range.
+                    if best.is_some() {
+                        next_first_row = Some(loc.first_row_index);
+                    }
+                    break;
+                }
                 _ => {
                     best = Some(loc);
                     prev_key = entry_key;
@@ -364,7 +392,7 @@ impl KvSparseIndex {
             }
         }
 
-        best
+        best.map(|loc| (loc, next_first_row))
     }
 
     /// Read the *full* key at restart point `idx`. By construction the
@@ -667,6 +695,50 @@ mod tests {
         for (k, l) in &entries {
             assert_eq!(idx.find_page(k), Some(*l));
         }
+    }
+
+    /// `find_page_with_next` returns both the matched page and the
+    /// `first_row_index` of the *next* entry — needed by the reader to
+    /// bound the matched page's row range when issuing a `RowSelection`.
+    #[test]
+    fn find_page_with_next_reports_successor_first_row() {
+        let entries: Vec<(Vec<u8>, PageLocation)> = vec![
+            (b"k01".to_vec(), loc(0, 8192, 0)),
+            (b"k02".to_vec(), loc(8192, 8192, 100)),
+            (b"k03".to_vec(), loc(16384, 8192, 250)),
+            (b"k04".to_vec(), loc(24576, 8192, 400)),
+        ];
+        let bytes = build(&entries, 2);
+        let idx = KvSparseIndex::from_bytes(bytes).unwrap();
+
+        // Exact hit on a non-last entry: next is the immediately following
+        // entry's first_row_index.
+        let (got, next) = idx.find_page_with_next(b"k02").unwrap();
+        assert_eq!(got, loc(8192, 8192, 100));
+        assert_eq!(next, Some(250));
+
+        // Predecessor lookup that lands on a non-last entry.
+        let (got, next) = idx.find_page_with_next(b"k02zzz").unwrap();
+        assert_eq!(got, loc(8192, 8192, 100));
+        assert_eq!(next, Some(250));
+
+        // First entry: next is entry 1's first_row_index.
+        let (got, next) = idx.find_page_with_next(b"k01").unwrap();
+        assert_eq!(got, loc(0, 8192, 0));
+        assert_eq!(next, Some(100));
+
+        // Last entry by exact hit: no successor.
+        let (got, next) = idx.find_page_with_next(b"k04").unwrap();
+        assert_eq!(got, loc(24576, 8192, 400));
+        assert_eq!(next, None);
+
+        // Past the end: matched is the final entry, no successor.
+        let (got, next) = idx.find_page_with_next(b"k99").unwrap();
+        assert_eq!(got, loc(24576, 8192, 400));
+        assert_eq!(next, None);
+
+        // Strictly before all entries: no match at all.
+        assert!(idx.find_page_with_next(b"k00").is_none());
     }
 
     /// Helper used in proptest-style smoke: build, decode, iterate, search.
