@@ -1,6 +1,12 @@
 //! `ParquetReader`: point lookup and range scan with Deletion Vector masking.
 //!
-//! Uses the `parquet` crate's Arrow reader for actual column reading.
+//! Reads via the `parquet` crate's Arrow record-batch reader, projecting
+//! only the columns needed for the file's level:
+//! - L0: `[_merutable_ikey, _merutable_value]` — two-column read; the
+//!   postcard blob carries the entire row, so a point lookup decodes one
+//!   row from one column chunk instead of N typed columns.
+//! - L1+: `[_merutable_ikey, ...all user columns]` — typed-column path;
+//!   no value blob exists at this tier.
 
 use std::sync::Arc;
 
@@ -12,24 +18,31 @@ use merutable_types::{
     value::Row,
     MeruError, Result,
 };
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ProjectionMask;
 use parquet::file::reader::{ChunkReader, FileReader, SerializedFileReader};
-use parquet::record::RowAccessor;
 use roaring::RoaringBitmap;
 
-use crate::{bloom::FastLocalBloom, codec::IKEY_COLUMN_NAME};
+use crate::{
+    bloom::FastLocalBloom,
+    codec::{self, IKEY_COLUMN_NAME, VALUE_BLOB_COLUMN_NAME},
+};
 
-pub struct ParquetReader<R: ChunkReader> {
-    file_reader: SerializedFileReader<R>,
+pub struct ParquetReader<R: ChunkReader + Clone> {
+    /// Original source, kept so we can rebuild a fresh
+    /// `ParquetRecordBatchReaderBuilder` per read. `Bytes` (the production
+    /// case) is cheaply `Clone`; `File` users should wrap with `try_clone`.
+    source: R,
     schema: Arc<TableSchema>,
     meta: ParquetFileMeta,
     bloom: Option<FastLocalBloom>,
 }
 
-impl<R: ChunkReader + 'static> ParquetReader<R> {
+impl<R: ChunkReader + Clone + 'static> ParquetReader<R> {
     /// Open a Parquet file for reading. Loads bloom filter from KV metadata if present.
     pub fn open(source: R, schema: Arc<TableSchema>) -> Result<Self> {
-        let file_reader =
-            SerializedFileReader::new(source).map_err(|e| MeruError::Parquet(e.to_string()))?;
+        let file_reader = SerializedFileReader::new(source.clone())
+            .map_err(|e| MeruError::Parquet(e.to_string()))?;
 
         // Read KV metadata from the file footer.
         let file_meta = file_reader.metadata().file_metadata();
@@ -69,7 +82,7 @@ impl<R: ChunkReader + 'static> ParquetReader<R> {
         });
 
         Ok(Self {
-            file_reader,
+            source,
             schema,
             meta,
             bloom,
@@ -98,25 +111,20 @@ impl<R: ChunkReader + 'static> ParquetReader<R> {
             return Ok(None);
         }
 
-        let ikeys = self.read_all_ikeys()?;
-        for (global_pos, ikey_bytes) in ikeys.iter().enumerate() {
+        let rows = self.read_all_rows()?;
+        for (global_pos, (ikey, row)) in rows.into_iter().enumerate() {
             if let Some(dv) = deleted_rows {
                 if dv.contains(global_pos as u32) {
                     continue;
                 }
             }
-            if ikey_bytes.len() < 8 {
+            if ikey.user_key_bytes() != user_key_bytes {
                 continue;
             }
-            let uk = &ikey_bytes[..ikey_bytes.len() - 8];
-            if uk != user_key_bytes {
-                continue;
-            }
-            let ikey = InternalKey::decode(ikey_bytes, &self.schema)?;
             if ikey.seq > read_seq {
                 continue;
             }
-            return Ok(Some((ikey, Row::default())));
+            return Ok(Some((ikey, row)));
         }
         Ok(None)
     }
@@ -129,17 +137,16 @@ impl<R: ChunkReader + 'static> ParquetReader<R> {
         read_seq: SeqNum,
         deleted_rows: Option<&RoaringBitmap>,
     ) -> Result<Vec<(InternalKey, Row)>> {
-        let ikeys = self.read_all_ikeys()?;
+        let rows = self.read_all_rows()?;
         let mut results = Vec::new();
         let mut last_uk: Option<Vec<u8>> = None;
 
-        for (global_pos, ikey_bytes) in ikeys.iter().enumerate() {
+        for (global_pos, (ikey, row)) in rows.into_iter().enumerate() {
             if let Some(dv) = deleted_rows {
                 if dv.contains(global_pos as u32) {
                     continue;
                 }
             }
-            let ikey = InternalKey::decode(ikey_bytes, &self.schema)?;
             if ikey.seq > read_seq {
                 continue;
             }
@@ -163,7 +170,7 @@ impl<R: ChunkReader + 'static> ParquetReader<R> {
             if ikey.op_type == OpType::Delete {
                 continue;
             }
-            results.push((ikey, Row::default()));
+            results.push((ikey, row));
         }
         Ok(results)
     }
@@ -172,52 +179,61 @@ impl<R: ChunkReader + 'static> ParquetReader<R> {
         &self.meta
     }
 
-    /// Read all ikey bytes from the file using the Arrow-based reader.
-    fn read_all_ikeys(&self) -> Result<Vec<Vec<u8>>> {
-        let file_meta = self.file_reader.metadata();
-        let ikey_col_idx = find_ikey_column_index(file_meta)?;
+    /// Read every row in the file as a fully-decoded `(InternalKey, Row)`
+    /// pair using a column-projected Arrow record-batch reader.
+    ///
+    /// Projection is level-aware:
+    /// - At L0 we ask only for `_merutable_ikey` and `_merutable_value`,
+    ///   then `codec::record_batch_to_rows` takes the postcard fast path
+    ///   and decodes each `Row` from a single column chunk's bytes.
+    /// - At L1+ we ask for `_merutable_ikey` plus every user column, and
+    ///   `codec::record_batch_to_rows` materializes each `Row` field by
+    ///   field from the typed Arrow arrays.
+    fn read_all_rows(&self) -> Result<Vec<(InternalKey, Row)>> {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(self.source.clone())
+            .map_err(|e| MeruError::Parquet(e.to_string()))?;
 
-        let mut all_ikeys = Vec::new();
-        let num_rg = file_meta.num_row_groups();
+        let parquet_schema = builder.parquet_schema();
+        let mut leaf_indices: Vec<usize> = Vec::new();
 
-        for rg_idx in 0..num_rg {
-            let rg_reader = self
-                .file_reader
-                .get_row_group(rg_idx)
-                .map_err(|e| MeruError::Parquet(e.to_string()))?;
-            let rg_meta = file_meta.row_group(rg_idx);
-            let num_rows = rg_meta.num_rows() as usize;
+        // Always project the ikey column.
+        leaf_indices.push(find_leaf(parquet_schema, IKEY_COLUMN_NAME)?);
 
-            // Use the row-level iterator to read the ikey column.
-            let mut row_iter = rg_reader
-                .get_row_iter(None)
-                .map_err(|e| MeruError::Parquet(e.to_string()))?;
-
-            for _ in 0..num_rows {
-                if let Some(row_result) = row_iter.next() {
-                    let row = row_result.map_err(|e| MeruError::Parquet(e.to_string()))?;
-                    // The ikey column is the first column (index 0).
-                    match row.get_bytes(ikey_col_idx) {
-                        Ok(ba) => all_ikeys.push(ba.data().to_vec()),
-                        Err(_) => all_ikeys.push(Vec::new()),
-                    }
-                }
+        if codec::level_has_value_blob(self.meta.level) {
+            // L0 fast path: only the value blob is needed; typed columns
+            // would be redundant work.
+            leaf_indices.push(find_leaf(parquet_schema, VALUE_BLOB_COLUMN_NAME)?);
+        } else {
+            // L1+: project every user-defined typed column.
+            for col in &self.schema.columns {
+                leaf_indices.push(find_leaf(parquet_schema, &col.name)?);
             }
         }
-        Ok(all_ikeys)
+
+        let mask = ProjectionMask::leaves(parquet_schema, leaf_indices);
+        let reader = builder
+            .with_projection(mask)
+            .build()
+            .map_err(|e| MeruError::Parquet(e.to_string()))?;
+
+        let mut out = Vec::with_capacity(self.meta.num_rows as usize);
+        for batch_result in reader {
+            let batch = batch_result.map_err(|e| MeruError::Parquet(e.to_string()))?;
+            let mut decoded = codec::record_batch_to_rows(&batch, &self.schema)?;
+            out.append(&mut decoded);
+        }
+        Ok(out)
     }
 }
 
-fn find_ikey_column_index(meta: &parquet::file::metadata::ParquetMetaData) -> Result<usize> {
-    let schema = meta.file_metadata().schema_descr();
+fn find_leaf(schema: &parquet::schema::types::SchemaDescriptor, name: &str) -> Result<usize> {
     for i in 0..schema.num_columns() {
-        if schema.column(i).name() == IKEY_COLUMN_NAME {
+        if schema.column(i).name() == name {
             return Ok(i);
         }
     }
     Err(MeruError::Corruption(format!(
-        "column '{}' not found in Parquet schema",
-        IKEY_COLUMN_NAME
+        "column '{name}' not found in Parquet schema"
     )))
 }
 
@@ -299,21 +315,25 @@ mod tests {
         let schema = test_schema();
         let ikey = make_ikey(42, 1);
         let uk = ikey.user_key_bytes().to_vec();
-        let rows = vec![(
-            ikey,
-            Row::new(vec![
-                Some(FieldValue::Int64(42)),
-                Some(FieldValue::Bytes(BBytes::from("found_me"))),
-            ]),
-        )];
+        let original_row = Row::new(vec![
+            Some(FieldValue::Int64(42)),
+            Some(FieldValue::Bytes(BBytes::from("found_me"))),
+        ]);
+        let rows = vec![(ikey, original_row.clone())];
 
         let bytes = write_test_file(rows, &schema);
         let reader = ParquetReader::open(BBytes::from(bytes), Arc::new(schema)).unwrap();
 
         let result = reader.get(&uk, SeqNum(10), None).unwrap();
         assert!(result.is_some());
-        let (ikey, _row) = result.unwrap();
+        let (ikey, row) = result.unwrap();
         assert_eq!(ikey.seq, SeqNum(1));
+        // Real value decode — not a Row::default() placeholder. The row
+        // returned by the reader must equal the row written, field-for-field.
+        assert_eq!(
+            row, original_row,
+            "reader must return the actual decoded row, not a default placeholder"
+        );
     }
 
     #[test]
@@ -412,20 +432,29 @@ mod tests {
     #[test]
     fn scan_returns_all_rows() {
         let schema = test_schema();
-        let rows: Vec<_> = (1..=5i64)
+        let originals: Vec<(InternalKey, Row)> = (1..=5i64)
             .map(|i| {
                 (
                     make_ikey(i, i as u64),
-                    Row::new(vec![Some(FieldValue::Int64(i)), None]),
+                    Row::new(vec![
+                        Some(FieldValue::Int64(i)),
+                        Some(FieldValue::Bytes(BBytes::from(format!("v{i}")))),
+                    ]),
                 )
             })
             .collect();
 
-        let bytes = write_test_file(rows, &schema);
+        let bytes = write_test_file(originals.clone(), &schema);
         let reader = ParquetReader::open(BBytes::from(bytes), Arc::new(schema)).unwrap();
 
         let results = reader.scan(None, None, SeqNum(100), None).unwrap();
         assert_eq!(results.len(), 5);
+        // Field-for-field equality: real value decode end-to-end.
+        for ((orig_ik, orig_row), (got_ik, got_row)) in originals.iter().zip(results.iter()) {
+            assert_eq!(orig_ik.seq, got_ik.seq);
+            assert_eq!(orig_ik.user_key_bytes(), got_ik.user_key_bytes());
+            assert_eq!(orig_row, got_row);
+        }
     }
 
     #[test]
@@ -449,6 +478,57 @@ mod tests {
 
         let results = reader.scan(None, None, SeqNum(100), Some(&dv)).unwrap();
         assert_eq!(results.len(), 3); // rows 0, 2, 4 survive
+    }
+
+    /// L1 files have no `_merutable_value` blob — the reader must take the
+    /// typed-column decode path and still reconstruct each `Row`
+    /// field-for-field. This is the cold-tier read contract: pure columnar
+    /// shape, full row materialization.
+    #[test]
+    fn l1_typed_only_decode_roundtrip() {
+        let schema = test_schema();
+        let originals: Vec<(InternalKey, Row)> = (1..=10i64)
+            .map(|i| {
+                let val = if i % 2 == 0 {
+                    Some(FieldValue::Bytes(BBytes::from(format!("payload_{i}"))))
+                } else {
+                    None
+                };
+                (
+                    make_ikey(i, i as u64),
+                    Row::new(vec![Some(FieldValue::Int64(i)), val]),
+                )
+            })
+            .collect();
+
+        // Write at Level(1) → no value blob column.
+        let (bytes, _bloom, _meta) = crate::writer::write_sorted_rows(
+            originals.clone(),
+            Arc::new(schema.clone()),
+            Level(1),
+            10,
+        )
+        .unwrap();
+        let reader = ParquetReader::open(BBytes::from(bytes), Arc::new(schema)).unwrap();
+
+        let scanned = reader.scan(None, None, SeqNum(100), None).unwrap();
+        assert_eq!(scanned.len(), originals.len());
+        for ((orig_ik, orig_row), (got_ik, got_row)) in originals.iter().zip(scanned.iter()) {
+            assert_eq!(orig_ik.seq, got_ik.seq);
+            assert_eq!(orig_ik.user_key_bytes(), got_ik.user_key_bytes());
+            assert_eq!(
+                orig_row, got_row,
+                "L1 typed-column decode must reproduce written rows exactly"
+            );
+        }
+
+        // Point lookup also goes through the typed-column path at L1.
+        let probe = make_ikey(4, 4);
+        let got = reader
+            .get(probe.user_key_bytes(), SeqNum(100), None)
+            .unwrap();
+        let (_, row) = got.expect("L1 point lookup must find existing key");
+        assert_eq!(&row, &originals[3].1);
     }
 
     #[test]

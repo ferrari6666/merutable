@@ -110,7 +110,7 @@ pub fn write_sorted_rows(
     }
 
     let estimated = rows.len();
-    let arrow_schema = codec::arrow_schema(&schema);
+    let arrow_schema = codec::arrow_schema(&schema, level);
 
     // Track stats.
     let mut bloom = FastLocalBloom::new(estimated.max(1000), bloom_bits_per_key);
@@ -218,7 +218,7 @@ fn arrow_write_pass(
     let mut writer = ArrowWriter::try_new(buf, arrow_schema.clone(), Some(props))
         .map_err(|e| MeruError::Parquet(e.to_string()))?;
 
-    let batch = codec::rows_to_record_batch(rows, schema)?;
+    let batch = codec::rows_to_record_batch(rows, schema, level)?;
     writer
         .write(&batch)
         .map_err(|e| MeruError::Parquet(e.to_string()))?;
@@ -252,7 +252,10 @@ fn extract_kv_index_entries(
         )
     })?;
 
-    // The `_merutable_ikey` column is always column 0 (see `codec::arrow_schema`).
+    // The `_merutable_ikey` column is always column 0 in both L0 and L1+
+    // schemas (see `codec::arrow_schema`). At L0 the `_merutable_value`
+    // postcard blob column is inserted *after* it, never before, so this
+    // index is invariant across the per-level schema shape.
     const IKEY_COL_IDX: usize = 0;
 
     let mut entries: Vec<(Vec<u8>, PageLocation)> = Vec::new();
@@ -554,6 +557,58 @@ mod tests {
             }
             prev = Some(k);
         }
+    }
+
+    /// L0 files must carry the `_merutable_value` postcard blob column so
+    /// hot-tier point lookups can decode an entire row from a single
+    /// column-chunk read; L1+ files must NOT carry it (cold tier is pure
+    /// typed-column analytics shape, redundant blobs would inflate scans).
+    /// This pins the per-level schema contract end-to-end through the
+    /// writer.
+    #[test]
+    fn l0_has_value_blob_column_l1_does_not() {
+        let schema = kv_index_test_schema();
+        let rows = make_test_rows(64, &schema);
+
+        let (l0_bytes, _, _) =
+            write_sorted_rows(rows.clone(), Arc::new(schema.clone()), Level(0), 10).unwrap();
+        let (l1_bytes, _, _) = write_sorted_rows(rows, Arc::new(schema), Level(1), 10).unwrap();
+
+        let l0_reader = SerializedFileReader::new(BBytes::from(l0_bytes)).unwrap();
+        let l1_reader = SerializedFileReader::new(BBytes::from(l1_bytes)).unwrap();
+
+        let l0_descr = l0_reader.metadata().file_metadata().schema_descr_ptr();
+        let l1_descr = l1_reader.metadata().file_metadata().schema_descr_ptr();
+        let l0_cols: Vec<String> = (0..l0_descr.num_columns())
+            .map(|i| l0_descr.column(i).name().to_string())
+            .collect();
+        let l1_cols: Vec<String> = (0..l1_descr.num_columns())
+            .map(|i| l1_descr.column(i).name().to_string())
+            .collect();
+
+        assert!(
+            l0_cols.iter().any(|c| c == crate::codec::IKEY_COLUMN_NAME),
+            "L0 must contain ikey column; got {l0_cols:?}"
+        );
+        assert!(
+            l0_cols
+                .iter()
+                .any(|c| c == crate::codec::VALUE_BLOB_COLUMN_NAME),
+            "L0 must contain value blob column; got {l0_cols:?}"
+        );
+        assert!(
+            l1_cols.iter().any(|c| c == crate::codec::IKEY_COLUMN_NAME),
+            "L1 must contain ikey column; got {l1_cols:?}"
+        );
+        assert!(
+            !l1_cols
+                .iter()
+                .any(|c| c == crate::codec::VALUE_BLOB_COLUMN_NAME),
+            "L1 must NOT contain value blob column; got {l1_cols:?}"
+        );
+        // Both levels must expose user-defined typed columns for HTAP visibility.
+        assert!(l0_cols.iter().any(|c| c == "id") && l0_cols.iter().any(|c| c == "payload"));
+        assert!(l1_cols.iter().any(|c| c == "id") && l1_cols.iter().any(|c| c == "payload"));
     }
 
     /// The empty-input fast path must NOT emit a kv_index entry — there

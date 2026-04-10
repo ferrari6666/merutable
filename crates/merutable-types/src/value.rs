@@ -14,7 +14,7 @@ pub enum FieldValue {
 
 /// A complete table row. Fields are parallel to `TableSchema::columns`.
 /// `None` = SQL NULL (only valid for nullable columns).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Row {
     pub fields: Vec<Option<FieldValue>>,
 }

@@ -29,6 +29,8 @@ proptest = { workspace = true }
 criterion = { workspace = true }
 tempfile  = { workspace = true }
 tokio     = { workspace = true, features = ["full"] }
+parquet   = { workspace = true }
+arrow     = { workspace = true }
 
 [[bench]]
 name    = "compaction"

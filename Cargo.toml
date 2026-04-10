@@ -59,6 +59,7 @@ tracing = { version = "0.1" }
 thiserror  = { version = "2" }
 serde      = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
+postcard   = { version = "1", features = ["use-std"] }
 
 # One-time init
 once_cell = { version = "1" }
