@@ -165,7 +165,7 @@ pub fn write_sorted_rows(
     // `_merutable_ikey` column, then build a `(first_key_on_page → location)`
     // sparse index over those boundaries.
     let kv_index_entries = extract_kv_index_entries(&rows, &pass1_bytes)?;
-    let kv_index_bytes = kv_index::build(&kv_index_entries, kv_index::DEFAULT_RESTART_INTERVAL);
+    let kv_index_bytes = kv_index::build(&kv_index_entries, kv_index::DEFAULT_RESTART_INTERVAL)?;
 
     // Pass 2: same input, same properties, plus the kv_index footer KV.
     // Determinism of `ArrowWriter` guarantees identical page layout and

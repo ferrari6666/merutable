@@ -118,11 +118,27 @@ pub struct PageLocation {
     pub first_row_index: u64,
 }
 
+/// Upper bound on a single key's length. The entry header encodes
+/// `suffix_len` (and `shared_prefix_len`) as `u16`, so a key whose
+/// suffix would exceed `u16::MAX` bytes cannot be represented. This is
+/// also well above any realistic InternalKey size (composite PK +
+/// seq/op_type trailer = tens to a few thousand bytes).
+pub const MAX_KEY_LEN: usize = u16::MAX as usize;
+
 /// Build the on-wire bytes for a `KvSparseIndex` from a strictly-ascending
 /// sequence of `(user_key, location)` pairs.
 ///
-/// Panics in debug mode if `entries` is not sorted by `user_key`.
-pub fn build(entries: &[(Vec<u8>, PageLocation)], restart_interval: u32) -> Bytes {
+/// Fails (not panics) if:
+/// - any key is longer than [`MAX_KEY_LEN`] (would silently truncate the
+///   u16 suffix_len field — a data-corruption bug);
+/// - the input is not strictly ascending by key (would produce an index
+///   whose binary search answers are meaningless).
+///
+/// The sort check used to be a `debug_assert!` which meant release
+/// builds silently accepted out-of-order input and shipped a broken
+/// index. It is now a runtime check — build runs once per flush, so the
+/// O(n) cost is amortized across a whole row group worth of writes.
+pub fn build(entries: &[(Vec<u8>, PageLocation)], restart_interval: u32) -> Result<Bytes> {
     let restart_interval = restart_interval.max(1);
     let num_entries = entries.len() as u32;
 
@@ -146,10 +162,18 @@ pub fn build(entries: &[(Vec<u8>, PageLocation)], restart_interval: u32) -> Byte
     let mut prev_key: &[u8] = &[];
 
     for (i, (key, loc)) in entries.iter().enumerate() {
-        debug_assert!(
-            i == 0 || key.as_slice() > prev_key,
-            "kv_index::build requires strictly ascending keys; entry {i} is out of order"
-        );
+        if key.len() > MAX_KEY_LEN {
+            return Err(MeruError::Parquet(format!(
+                "kv_index::build: key {i} has length {} bytes, exceeds MAX_KEY_LEN ({MAX_KEY_LEN})",
+                key.len()
+            )));
+        }
+        if i > 0 && key.as_slice() <= prev_key {
+            return Err(MeruError::Parquet(format!(
+                "kv_index::build requires strictly ascending keys; entry {i} is not > entry {}",
+                i - 1
+            )));
+        }
 
         let is_restart = (i as u32).is_multiple_of(restart_interval);
         let shared = if is_restart {
@@ -163,7 +187,9 @@ pub fn build(entries: &[(Vec<u8>, PageLocation)], restart_interval: u32) -> Byte
             restart_offsets.push(entries_buf.len() as u32);
         }
 
-        // u16 shared, u16 suffix_len, suffix bytes
+        // u16 shared, u16 suffix_len, suffix bytes. `shared` and
+        // `suffix.len()` are both ≤ key.len() ≤ MAX_KEY_LEN, checked
+        // above, so the u16 casts are lossless.
         entries_buf.extend_from_slice(&(shared as u16).to_le_bytes());
         entries_buf.extend_from_slice(&(suffix.len() as u16).to_le_bytes());
         entries_buf.extend_from_slice(suffix);
@@ -195,7 +221,7 @@ pub fn build(entries: &[(Vec<u8>, PageLocation)], restart_interval: u32) -> Byte
         out.extend_from_slice(&ro.to_le_bytes());
     }
 
-    Bytes::from(out)
+    Ok(Bytes::from(out))
 }
 
 /// Length of the longest common prefix of `a` and `b`.
@@ -235,7 +261,21 @@ pub struct KvSparseIndex {
 }
 
 impl KvSparseIndex {
-    /// Parse and validate the index header. Does not eagerly decode entries.
+    /// Parse and fully validate the on-wire index buffer.
+    ///
+    /// After this returns `Ok`, every entry in the buffer is guaranteed
+    /// to be structurally well-formed: all byte offsets lie within the
+    /// entries section, all `shared_prefix_len` values are ≤ the
+    /// preceding entry's rebuilt-key length, every restart entry has
+    /// `shared = 0`, and the restart table offsets are monotonically
+    /// increasing and point at entry boundaries.
+    ///
+    /// This lets the hot decode path ([`find_page`], [`iter`]) remain
+    /// infallible — it would be a bug for decode to panic on any
+    /// instance returned by this function.
+    ///
+    /// [`find_page`]: KvSparseIndex::find_page
+    /// [`iter`]: KvSparseIndex::iter
     pub fn from_bytes(bytes: Bytes) -> Result<Self> {
         if bytes.len() < HEADER_SIZE {
             return Err(MeruError::Corruption(format!(
@@ -256,24 +296,132 @@ impl KvSparseIndex {
         let entries_size = u32_at(&bytes, 12) as usize;
         let num_restarts = u32_at(&bytes, 16) as usize;
 
-        let entries_offset = HEADER_SIZE;
-        let restart_section_offset = entries_offset + entries_size;
-        let expected_total = restart_section_offset + 4 * num_restarts;
-        if bytes.len() < expected_total {
-            return Err(MeruError::Corruption(format!(
-                "kv_index: truncated buffer (have {}, need {expected_total})",
-                bytes.len()
-            )));
-        }
         if restart_interval == 0 {
             return Err(MeruError::Corruption(
                 "kv_index: restart_interval is 0".into(),
             ));
         }
 
-        let mut restart_offsets = Vec::with_capacity(num_restarts);
+        let entries_offset = HEADER_SIZE;
+        // Check total length (header + entries + restart table) with
+        // checked arithmetic so a malicious num_restarts can't overflow
+        // usize on the subsequent range index.
+        let restart_table_bytes = num_restarts
+            .checked_mul(4)
+            .ok_or_else(|| MeruError::Corruption("kv_index: num_restarts overflow".into()))?;
+        let restart_section_offset = entries_offset
+            .checked_add(entries_size)
+            .ok_or_else(|| MeruError::Corruption("kv_index: entries_size overflow".into()))?;
+        let expected_total = restart_section_offset
+            .checked_add(restart_table_bytes)
+            .ok_or_else(|| MeruError::Corruption("kv_index: total size overflow".into()))?;
+        if bytes.len() != expected_total {
+            return Err(MeruError::Corruption(format!(
+                "kv_index: buffer size mismatch (have {}, need exactly {expected_total})",
+                bytes.len()
+            )));
+        }
+
+        // Load and validate the restart offsets. Each must be strictly
+        // increasing and all must be ≤ entries_size.
+        let mut restart_offsets: Vec<u32> = Vec::with_capacity(num_restarts);
+        let mut prev_ro: Option<u32> = None;
         for i in 0..num_restarts {
-            restart_offsets.push(u32_at(&bytes, restart_section_offset + 4 * i));
+            let ro = u32_at(&bytes, restart_section_offset + 4 * i);
+            if (ro as usize) > entries_size {
+                return Err(MeruError::Corruption(format!(
+                    "kv_index: restart_offset[{i}] = {ro} exceeds entries_size {entries_size}"
+                )));
+            }
+            if let Some(prev) = prev_ro {
+                if ro <= prev && i > 0 {
+                    return Err(MeruError::Corruption(format!(
+                        "kv_index: restart_offset[{i}] = {ro} is not > previous {prev}"
+                    )));
+                }
+            }
+            prev_ro = Some(ro);
+            restart_offsets.push(ro);
+        }
+
+        // Consistency: num_restarts must match what build() would have
+        // produced for the stated num_entries + restart_interval.
+        let expected_restarts = if num_entries == 0 {
+            0
+        } else {
+            num_entries.div_ceil(restart_interval) as usize
+        };
+        if num_restarts != expected_restarts {
+            return Err(MeruError::Corruption(format!(
+                "kv_index: num_restarts {num_restarts} inconsistent with num_entries \
+                 {num_entries} / restart_interval {restart_interval} (expected {expected_restarts})"
+            )));
+        }
+
+        // Walk every entry once, validating bounds and invariants.
+        // After this succeeds, the decode paths can index the buffer
+        // without any bounds checks beyond the ones the compiler
+        // inserts for slicing.
+        {
+            let mut cursor = 0usize;
+            let mut prev_key_len: usize = 0;
+            let entries_end = entries_size;
+            for i in 0..num_entries as usize {
+                let abs = entries_offset + cursor;
+                // Header (4 bytes: shared + suffix_len).
+                if cursor + ENTRY_HEADER > entries_end {
+                    return Err(MeruError::Corruption(format!(
+                        "kv_index: entry {i} header overruns entries section"
+                    )));
+                }
+                let shared = u16_at(&bytes, abs) as usize;
+                let suffix_len = u16_at(&bytes, abs + 2) as usize;
+
+                let is_restart = (i as u32).is_multiple_of(restart_interval);
+                if is_restart && shared != 0 {
+                    return Err(MeruError::Corruption(format!(
+                        "kv_index: restart entry {i} has shared={shared} (expected 0)"
+                    )));
+                }
+                if shared > prev_key_len {
+                    return Err(MeruError::Corruption(format!(
+                        "kv_index: entry {i} shared={shared} exceeds previous key length {prev_key_len}"
+                    )));
+                }
+
+                // Suffix + fixed tail must fit in entries_size.
+                let need = ENTRY_HEADER + suffix_len + ENTRY_FIXED_TAIL;
+                if cursor + need > entries_end {
+                    return Err(MeruError::Corruption(format!(
+                        "kv_index: entry {i} body overruns entries section \
+                         (need {need} at cursor {cursor}, entries_size {entries_end})"
+                    )));
+                }
+
+                // The restart table must reference this exact byte
+                // offset if entry i is a restart. (Prevents a corrupt
+                // restart table from mis-binary-searching.)
+                if is_restart {
+                    let restart_idx = (i as u32 / restart_interval) as usize;
+                    let expected_ro = cursor as u32;
+                    if restart_offsets[restart_idx] != expected_ro {
+                        return Err(MeruError::Corruption(format!(
+                            "kv_index: restart_offset[{restart_idx}] = {} does not point at \
+                             entry {i} (expected byte offset {expected_ro})",
+                            restart_offsets[restart_idx]
+                        )));
+                    }
+                }
+
+                prev_key_len = shared + suffix_len;
+                cursor += need;
+            }
+            if cursor != entries_end {
+                return Err(MeruError::Corruption(format!(
+                    "kv_index: trailing bytes in entries section (walked {cursor}, \
+                     entries_size {entries_end})"
+                )));
+            }
         }
 
         Ok(Self {
@@ -510,7 +658,7 @@ mod tests {
     /// Empty index encodes, decodes, and reports zero length.
     #[test]
     fn empty_index_round_trip() {
-        let bytes = build(&[], DEFAULT_RESTART_INTERVAL);
+        let bytes = build(&[], DEFAULT_RESTART_INTERVAL).unwrap();
         let idx = KvSparseIndex::from_bytes(bytes).unwrap();
         assert_eq!(idx.len(), 0);
         assert!(idx.is_empty());
@@ -522,7 +670,7 @@ mod tests {
     #[test]
     fn single_entry_returns_for_anything_geq() {
         let entries = vec![(b"banana".to_vec(), loc(100, 8192, 0))];
-        let bytes = build(&entries, DEFAULT_RESTART_INTERVAL);
+        let bytes = build(&entries, DEFAULT_RESTART_INTERVAL).unwrap();
         let idx = KvSparseIndex::from_bytes(bytes).unwrap();
         assert_eq!(idx.len(), 1);
         assert_eq!(idx.find_page(b"apple"), None); // before first key
@@ -544,7 +692,7 @@ mod tests {
         let entries: Vec<(Vec<u8>, PageLocation)> =
             raw.iter().map(|(k, l)| (k.to_vec(), *l)).collect();
 
-        let bytes = build(&entries, 2); // restart every 2 entries
+        let bytes = build(&entries, 2).unwrap(); // restart every 2 entries
         let idx = KvSparseIndex::from_bytes(bytes).unwrap();
 
         assert_eq!(idx.len(), 5);
@@ -596,7 +744,7 @@ mod tests {
 
         let entries: Vec<(Vec<u8>, PageLocation)> =
             oracle.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        let bytes = build(&entries, DEFAULT_RESTART_INTERVAL);
+        let bytes = build(&entries, DEFAULT_RESTART_INTERVAL).unwrap();
         let idx = KvSparseIndex::from_bytes(bytes).unwrap();
 
         // Every key in the oracle is found exactly.
@@ -635,7 +783,7 @@ mod tests {
             .collect();
 
         let raw_key_bytes: usize = entries.iter().map(|(k, _)| k.len()).sum();
-        let bytes = build(&entries, DEFAULT_RESTART_INTERVAL);
+        let bytes = build(&entries, DEFAULT_RESTART_INTERVAL).unwrap();
         let idx = KvSparseIndex::from_bytes(bytes.clone()).unwrap();
 
         let on_disk = idx.encoded_size();
@@ -659,7 +807,7 @@ mod tests {
         let entries: Vec<(Vec<u8>, PageLocation)> = (0..32u64)
             .map(|i| (format!("k{i:04}").into_bytes(), loc(i, 1, i)))
             .collect();
-        let bytes = build(&entries, DEFAULT_RESTART_INTERVAL);
+        let bytes = build(&entries, DEFAULT_RESTART_INTERVAL).unwrap();
 
         // Drop the last 8 bytes (chops the restart table).
         let truncated = bytes.slice(..bytes.len() - 8);
@@ -676,7 +824,7 @@ mod tests {
     #[test]
     fn wrong_version_is_rejected() {
         let entries: Vec<(Vec<u8>, PageLocation)> = vec![(b"hello".to_vec(), loc(0, 1, 0))];
-        let bytes = build(&entries, DEFAULT_RESTART_INTERVAL);
+        let bytes = build(&entries, DEFAULT_RESTART_INTERVAL).unwrap();
         let mut tampered = bytes.to_vec();
         tampered[0] = 99;
         let result = KvSparseIndex::from_bytes(Bytes::from(tampered));
@@ -690,7 +838,7 @@ mod tests {
         let entries: Vec<(Vec<u8>, PageLocation)> = (0..16u64)
             .map(|i| (format!("k{i:04}").into_bytes(), loc(i * 100, 50, i)))
             .collect();
-        let bytes = build(&entries, 1);
+        let bytes = build(&entries, 1).unwrap();
         let idx = KvSparseIndex::from_bytes(bytes).unwrap();
         for (k, l) in &entries {
             assert_eq!(idx.find_page(k), Some(*l));
@@ -708,7 +856,7 @@ mod tests {
             (b"k03".to_vec(), loc(16384, 8192, 250)),
             (b"k04".to_vec(), loc(24576, 8192, 400)),
         ];
-        let bytes = build(&entries, 2);
+        let bytes = build(&entries, 2).unwrap();
         let idx = KvSparseIndex::from_bytes(bytes).unwrap();
 
         // Exact hit on a non-last entry: next is the immediately following
@@ -762,12 +910,180 @@ mod tests {
             .enumerate()
             .map(|(i, k)| (k.to_vec(), loc(i as u64 * 8, 8, i as u64)))
             .collect();
-        let bytes = build(&entries, 4);
+        let bytes = build(&entries, 4).unwrap();
         let idx = KvSparseIndex::from_bytes(bytes).unwrap();
         let yielded: Vec<Vec<u8>> = idx.iter().map(|(k, _)| k).collect();
         assert_eq!(
             yielded,
             raw_keys.iter().map(|k| k.to_vec()).collect::<Vec<_>>()
         );
+    }
+
+    // ── Negative / corruption tests (post-hardening) ─────────────────────
+
+    /// A key longer than `MAX_KEY_LEN` (u16::MAX bytes) cannot be
+    /// encoded without silently truncating `suffix_len`. Before the
+    /// fix, `build` cast `suffix.len() as u16` unchecked, producing a
+    /// valid-looking buffer with the wrong key bytes at decode time.
+    #[test]
+    fn build_rejects_key_longer_than_u16() {
+        let oversized = vec![0x41u8; MAX_KEY_LEN + 1];
+        let entries = vec![(oversized, loc(0, 1, 0))];
+        let err = build(&entries, DEFAULT_RESTART_INTERVAL).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("MAX_KEY_LEN") || msg.contains("exceeds"),
+            "error should name the length limit: {msg}"
+        );
+    }
+
+    /// A key of exactly `MAX_KEY_LEN` bytes must round-trip (boundary
+    /// test — make sure the off-by-one lands on the correct side).
+    #[test]
+    fn build_accepts_key_at_u16_max() {
+        let at_limit = vec![0x42u8; MAX_KEY_LEN];
+        let entries = vec![(at_limit.clone(), loc(42, 1, 7))];
+        let bytes = build(&entries, DEFAULT_RESTART_INTERVAL).unwrap();
+        let idx = KvSparseIndex::from_bytes(bytes).unwrap();
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx.find_page(&at_limit), Some(loc(42, 1, 7)));
+    }
+
+    /// Out-of-order input must fail at build time in release mode, not
+    /// just panic in debug. Before the fix this was a `debug_assert!`
+    /// so release builds shipped a silently-broken index.
+    #[test]
+    fn build_rejects_unsorted_input() {
+        let entries = vec![
+            (b"zebra".to_vec(), loc(0, 1, 0)),
+            (b"apple".to_vec(), loc(1, 1, 1)),
+        ];
+        let err = build(&entries, DEFAULT_RESTART_INTERVAL).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("strictly ascending") || msg.contains("not >"),
+            "{msg}"
+        );
+    }
+
+    /// Duplicate adjacent keys are also rejected (strictly ascending
+    /// means no equals).
+    #[test]
+    fn build_rejects_duplicate_adjacent_keys() {
+        let entries = vec![
+            (b"dup".to_vec(), loc(0, 1, 0)),
+            (b"dup".to_vec(), loc(1, 1, 1)),
+        ];
+        assert!(build(&entries, DEFAULT_RESTART_INTERVAL).is_err());
+    }
+
+    /// A buffer with trailing garbage past the restart table must be
+    /// rejected by `from_bytes`. Previously the length check was
+    /// `bytes.len() < expected_total` which silently accepted trailing
+    /// bytes — they'd be read by neither decode nor iter but the hash
+    /// of the bytes would still differ between producer and consumer.
+    #[test]
+    fn from_bytes_rejects_trailing_garbage() {
+        let entries: Vec<(Vec<u8>, PageLocation)> = (0..8u64)
+            .map(|i| (format!("k{i:04}").into_bytes(), loc(i, 1, i)))
+            .collect();
+        let bytes = build(&entries, DEFAULT_RESTART_INTERVAL).unwrap();
+        let mut padded = bytes.to_vec();
+        padded.extend_from_slice(b"trailing garbage");
+        let err = KvSparseIndex::from_bytes(Bytes::from(padded)).unwrap_err();
+        assert!(matches!(err, MeruError::Corruption(_)));
+    }
+
+    /// A corrupt restart_offset that points past the end of the
+    /// entries section must be rejected at `from_bytes` time so decode
+    /// paths can stay infallible.
+    #[test]
+    fn from_bytes_rejects_restart_offset_out_of_range() {
+        let entries: Vec<(Vec<u8>, PageLocation)> = (0..4u64)
+            .map(|i| (format!("k{i:04}").into_bytes(), loc(i, 1, i)))
+            .collect();
+        let bytes = build(&entries, 2).unwrap();
+
+        // Tamper: overwrite the first restart offset with a huge value.
+        let entries_size = u32_at(&bytes, 12) as usize;
+        let num_restarts = u32_at(&bytes, 16) as usize;
+        assert!(num_restarts >= 1);
+        let restart_table_start = HEADER_SIZE + entries_size;
+        let mut tampered = bytes.to_vec();
+        // Write a value past the end of the entries section.
+        let bad = (entries_size as u32 + 9999).to_le_bytes();
+        tampered[restart_table_start..restart_table_start + 4].copy_from_slice(&bad);
+        let err = KvSparseIndex::from_bytes(Bytes::from(tampered)).unwrap_err();
+        assert!(matches!(err, MeruError::Corruption(_)));
+    }
+
+    /// A corrupt entry whose `shared_prefix_len` exceeds the length of
+    /// the previous key must be rejected — otherwise the decode path
+    /// would panic on `prev_key[..shared]` slicing.
+    #[test]
+    fn from_bytes_rejects_shared_exceeding_prev_key() {
+        // Two short keys, restart_interval=4 so entry 1 is NOT a
+        // restart and carries a shared_prefix_len field we can tamper.
+        let entries = vec![
+            (b"aa".to_vec(), loc(0, 1, 0)),
+            (b"ab".to_vec(), loc(1, 1, 1)),
+        ];
+        let bytes = build(&entries, 4).unwrap();
+        let mut tampered = bytes.to_vec();
+        // Locate entry 1's header: entry 0 is at HEADER_SIZE, has
+        // 4-byte header + 2-byte suffix + 20-byte tail = 26 bytes.
+        // Entry 1 starts at HEADER_SIZE + 26.
+        let entry1_off = HEADER_SIZE + 4 + 2 + 20;
+        // Rewrite shared = 99 (> prev key length 2).
+        tampered[entry1_off..entry1_off + 2].copy_from_slice(&99u16.to_le_bytes());
+        let err = KvSparseIndex::from_bytes(Bytes::from(tampered)).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("shared") && msg.contains("exceeds"),
+            "error should name the shared/prev-key mismatch: {msg}"
+        );
+    }
+
+    /// A corrupt restart entry (one where the restart table offset
+    /// points at an entry whose stored `shared` is non-zero) must be
+    /// rejected. Such a buffer would mis-answer binary search because
+    /// the "restart key" the searcher reads would be only the suffix
+    /// rather than the full key.
+    #[test]
+    fn from_bytes_rejects_restart_entry_with_nonzero_shared() {
+        // Two-entry buffer, restart_interval=1 → entry 1 is a restart.
+        // Tamper entry 1's shared field to 1.
+        let entries = vec![
+            (b"aa".to_vec(), loc(0, 1, 0)),
+            (b"ab".to_vec(), loc(1, 1, 1)),
+        ];
+        let bytes = build(&entries, 1).unwrap();
+        let mut tampered = bytes.to_vec();
+        // Each entry: 4-byte header + 2-byte suffix + 20-byte tail = 26 bytes.
+        let entry1_off = HEADER_SIZE + 26;
+        tampered[entry1_off..entry1_off + 2].copy_from_slice(&1u16.to_le_bytes());
+        let err = KvSparseIndex::from_bytes(Bytes::from(tampered)).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("restart entry") && msg.contains("shared"),
+            "{msg}"
+        );
+    }
+
+    /// Header claims `num_restarts` that disagrees with what `build`
+    /// would have produced for the stated `num_entries` /
+    /// `restart_interval`. Such a mismatch means at least one of the
+    /// three fields is corrupt; reject it.
+    #[test]
+    fn from_bytes_rejects_inconsistent_num_restarts() {
+        let entries: Vec<(Vec<u8>, PageLocation)> = (0..8u64)
+            .map(|i| (format!("k{i:04}").into_bytes(), loc(i, 1, i)))
+            .collect();
+        let bytes = build(&entries, 4).unwrap(); // 8 entries, interval 4 → 2 restarts
+        let mut tampered = bytes.to_vec();
+        // Rewrite num_restarts field (offset 16, u32 LE) to 99.
+        tampered[16..20].copy_from_slice(&99u32.to_le_bytes());
+        let err = KvSparseIndex::from_bytes(Bytes::from(tampered)).unwrap_err();
+        assert!(matches!(err, MeruError::Corruption(_)));
     }
 }
