@@ -23,6 +23,7 @@
 //! the table later.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -30,7 +31,11 @@ use std::{
 use merutable_types::{level::Level, schema::TableSchema, MeruError, Result};
 use tokio::sync::Mutex;
 
-use crate::{manifest::Manifest, snapshot::SnapshotTransaction, version::Version};
+use crate::{
+    manifest::{DvLocation, Manifest},
+    snapshot::SnapshotTransaction,
+    version::Version,
+};
 
 // ── IcebergCatalog ───────────────────────────────────────────────────────────
 
@@ -104,10 +109,14 @@ impl IcebergCatalog {
 
         let new_snapshot_id = *next_ver;
 
-        // Upload puffin files for DV updates.
+        // Upload puffin files for DV updates AND record their real
+        // on-storage blob coordinates so the manifest can point at the
+        // exact byte range of each roaring-bitmap blob. Skipping this
+        // step was a real bug: the manifest used to stamp (0, 0)
+        // placeholders and every deleted row reappeared on reload.
+        let mut dv_locations: HashMap<String, DvLocation> = HashMap::new();
         for (parquet_path, dv) in &txn.dvs {
-            let puffin_bytes =
-                dv.to_puffin_bytes(parquet_path, new_snapshot_id, new_snapshot_id)?;
+            let encoded = dv.encode_puffin(parquet_path, new_snapshot_id, new_snapshot_id)?;
             let puffin_filename = format!(
                 "{}.dv-{new_snapshot_id}.puffin",
                 Path::new(parquet_path)
@@ -119,20 +128,33 @@ impl IcebergCatalog {
             let level_dir = Path::new(parquet_path)
                 .parent()
                 .unwrap_or(Path::new("data/L0"));
-            let puffin_path = self.base_path.join(level_dir).join(&puffin_filename);
+            let rel_puffin_path = level_dir.join(&puffin_filename);
+            let abs_puffin_path = self.base_path.join(&rel_puffin_path);
             // Ensure parent dir exists.
-            if let Some(parent) = puffin_path.parent() {
+            if let Some(parent) = abs_puffin_path.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(MeruError::Io)?;
             }
-            tokio::fs::write(&puffin_path, &puffin_bytes)
+            tokio::fs::write(&abs_puffin_path, &encoded.bytes)
                 .await
                 .map_err(MeruError::Io)?;
+
+            dv_locations.insert(
+                parquet_path.clone(),
+                DvLocation {
+                    dv_path: rel_puffin_path.to_string_lossy().into_owned(),
+                    dv_offset: encoded.blob_offset,
+                    dv_length: encoded.blob_length,
+                },
+            );
         }
 
-        // Apply transaction to produce new manifest.
-        let new_manifest = current.apply(txn, new_snapshot_id);
+        // Apply transaction to produce new manifest. `apply` validates
+        // that every DV in `txn.dvs` has a matching entry in
+        // `dv_locations`; it errors out if the caller forgot any, so
+        // the zero-placeholder bug cannot recur silently.
+        let new_manifest = current.apply(txn, new_snapshot_id, &dv_locations)?;
 
         // Write manifest JSON.
         let meta_path = self

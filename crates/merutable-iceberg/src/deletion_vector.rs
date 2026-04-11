@@ -32,6 +32,22 @@ const PUFFIN_MAGIC: [u8; 4] = [0x50, 0x46, 0x41, 0x31];
 /// Minimum valid Puffin file: magic(4) + footer_len(4) + magic(4) = 12 bytes.
 const PUFFIN_MIN_SIZE: usize = 12;
 
+// ── PuffinEncoded ────────────────────────────────────────────────────────────
+
+/// Output of [`DeletionVector::encode_puffin`]: the complete Puffin
+/// file bytes together with the byte range of the roaring-bitmap blob
+/// inside those bytes. Both fields must be persisted to the Iceberg
+/// manifest so readers can seek directly to the blob.
+#[derive(Clone, Debug)]
+pub struct PuffinEncoded {
+    /// Full Puffin file, ready to be written to object storage.
+    pub bytes: Bytes,
+    /// Byte offset of the roaring-bitmap blob inside `bytes`.
+    pub blob_offset: i64,
+    /// Byte length of the roaring-bitmap blob inside `bytes`.
+    pub blob_length: i64,
+}
+
 // ── DeletionVector ───────────────────────────────────────────────────────────
 
 /// Roaring bitmap of deleted row positions within a single Parquet file.
@@ -90,17 +106,26 @@ impl DeletionVector {
 
     // ── Puffin serialization ─────────────────────────────────────────────
 
-    /// Serialize this DV as a complete Puffin file.
+    /// Serialize this DV as a complete Puffin file AND return the exact
+    /// `[blob_offset, blob_offset + blob_length)` byte range of the
+    /// roaring bitmap blob within those bytes.
+    ///
+    /// Callers persisting the file to object storage MUST record
+    /// `blob_offset` and `blob_length` in the Iceberg manifest so that
+    /// readers can seek to the blob without re-parsing the entire
+    /// Puffin footer. An earlier version stamped placeholder zeros into
+    /// the manifest; on reload the deletion bitmap was silently empty
+    /// and previously-deleted rows reappeared.
     ///
     /// `parquet_path`: the referenced Parquet data file (absolute object-store path).
     /// `snapshot_id`: Iceberg snapshot that produced this DV.
     /// `sequence_number`: Iceberg sequence number for this DV blob.
-    pub fn to_puffin_bytes(
+    pub fn encode_puffin(
         &self,
         parquet_path: &str,
         snapshot_id: i64,
         sequence_number: i64,
-    ) -> Result<Bytes> {
+    ) -> Result<PuffinEncoded> {
         // Serialize roaring bitmap to portable format.
         let mut blob_data = Vec::new();
         self.bitmap
@@ -145,7 +170,24 @@ impl DeletionVector {
         buf.put_i32_le(footer_len);
         buf.put_slice(&PUFFIN_MAGIC);
 
-        Ok(buf.freeze())
+        Ok(PuffinEncoded {
+            bytes: buf.freeze(),
+            blob_offset,
+            blob_length,
+        })
+    }
+
+    /// Legacy wrapper kept for tests that only care about the final
+    /// Puffin bytes. Production code MUST use `encode_puffin` so that
+    /// the blob offset/length can be persisted into the manifest.
+    pub fn to_puffin_bytes(
+        &self,
+        parquet_path: &str,
+        snapshot_id: i64,
+        sequence_number: i64,
+    ) -> Result<Bytes> {
+        self.encode_puffin(parquet_path, snapshot_id, sequence_number)
+            .map(|p| p.bytes)
     }
 
     /// Deserialize a DV from a complete Puffin file.

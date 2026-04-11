@@ -16,6 +16,24 @@ use merutable_types::{
 
 use crate::version::{DataFileMeta, Version};
 
+// ── DvLocation ───────────────────────────────────────────────────────────────
+
+/// Real on-storage coordinates of a DV's Puffin blob. Produced by the
+/// catalog commit path after writing the Puffin file and passed into
+/// [`Manifest::apply`] so that DV pointers in the manifest point at
+/// actual byte ranges. Placeholder zeros are NOT acceptable — the
+/// earlier design stamped `(0, 0)` and caused deleted rows to reappear
+/// on reload.
+#[derive(Clone, Debug)]
+pub struct DvLocation {
+    /// Object-store path of the Puffin file.
+    pub dv_path: String,
+    /// Byte offset of the roaring-bitmap blob inside the Puffin file.
+    pub dv_offset: i64,
+    /// Byte length of the roaring-bitmap blob.
+    pub dv_length: i64,
+}
+
 // ── ManifestEntry ────────────────────────────────────────────────────────────
 
 /// A single file entry as stored in our manifest (simplified Iceberg manifest
@@ -128,7 +146,33 @@ impl Manifest {
 
     /// Apply a `SnapshotTransaction` to produce a new manifest.
     /// This is the core commit logic for the embedded FS catalog.
-    pub fn apply(&self, txn: &crate::snapshot::SnapshotTransaction, new_snapshot_id: i64) -> Self {
+    ///
+    /// `dv_locations` carries the real `(dv_path, dv_offset, dv_length)`
+    /// for every DV in `txn.dvs`. The catalog computes these after
+    /// writing the Puffin file to object storage and must pass them in
+    /// here. If `txn.dvs` contains a key that is not present in
+    /// `dv_locations`, this is a programmer bug and returns an error
+    /// (previously the manifest silently stamped zeros, which caused
+    /// every DV to be invisible on reload).
+    pub fn apply(
+        &self,
+        txn: &crate::snapshot::SnapshotTransaction,
+        new_snapshot_id: i64,
+        dv_locations: &HashMap<String, DvLocation>,
+    ) -> Result<Self> {
+        // Sanity-check: every DV in the transaction must have a real
+        // location recorded. A missing entry means the caller forgot to
+        // upload the puffin file or forgot to thread the offsets back.
+        for path in txn.dvs.keys() {
+            if !dv_locations.contains_key(path) {
+                return Err(MeruError::Iceberg(format!(
+                    "apply: DV for '{path}' missing from dv_locations — \
+                     commit path must upload the puffin file and record \
+                     its blob_offset/blob_length before applying"
+                )));
+            }
+        }
+
         let remove_set: std::collections::HashSet<&str> =
             txn.removes.iter().map(|s| s.as_str()).collect();
 
@@ -143,19 +187,16 @@ impl Manifest {
                 continue; // fully compacted — drop
             }
             let mut e = entry.clone();
-            // Apply DV update if present.
-            if let Some(_dv) = txn.dvs.get(&entry.path) {
-                let dv_path = format!(
-                    "{}.dv-{}.puffin",
-                    entry.path.trim_end_matches(".parquet"),
-                    new_snapshot_id
-                );
-                // DV offset/length are set to 0 here; the catalog commit path
-                // fills in the real values after uploading the puffin file.
-                e.dv_path = Some(dv_path);
-                e.dv_offset = Some(0);
-                e.dv_length = Some(0);
-                // Also update the embedded ParquetFileMeta DV fields.
+            // Apply DV update if present. The location map is the
+            // source of truth for dv_path/offset/length.
+            if txn.dvs.contains_key(&entry.path) {
+                let loc = &dv_locations[&entry.path];
+                e.dv_path = Some(loc.dv_path.clone());
+                e.dv_offset = Some(loc.dv_offset);
+                e.dv_length = Some(loc.dv_length);
+                // Mirror into the embedded ParquetFileMeta so readers
+                // that consult the file-level metadata see the same
+                // coordinates as readers that consult the manifest.
                 e.meta.dv_path = e.dv_path.clone();
                 e.meta.dv_offset = e.dv_offset;
                 e.meta.dv_length = e.dv_length;
@@ -178,12 +219,12 @@ impl Manifest {
         let mut props = self.properties.clone();
         props.extend(txn.props.iter().map(|(k, v)| (k.clone(), v.clone())));
 
-        Manifest {
+        Ok(Manifest {
             snapshot_id: new_snapshot_id,
             schema: self.schema.clone(),
             entries: new_entries,
             properties: props,
-        }
+        })
     }
 
     /// Number of live (non-deleted) file entries.
@@ -269,7 +310,7 @@ mod tests {
         });
         txn.set_prop("merutable.job", "flush");
 
-        let m2 = m.apply(&txn, 1);
+        let m2 = m.apply(&txn, 1, &HashMap::new()).unwrap();
         assert_eq!(m2.snapshot_id, 1);
         assert_eq!(m2.live_file_count(), 1);
         assert_eq!(m2.entries[0].path, "data/L0/a.parquet");
@@ -309,7 +350,7 @@ mod tests {
             meta: test_meta(1, 1, 20, b"\x01", b"\x08"),
         });
 
-        let m2 = m.apply(&txn, 2);
+        let m2 = m.apply(&txn, 2, &HashMap::new()).unwrap();
         assert_eq!(m2.snapshot_id, 2);
         assert_eq!(m2.live_file_count(), 1);
         assert_eq!(m2.entries[0].path, "data/L1/merged.parquet");
@@ -341,15 +382,68 @@ mod tests {
             meta: test_meta(1, 1, 10, b"\x01", b"\x03"),
         });
 
-        let m2 = m.apply(&txn, 2);
+        // Supply real on-storage coordinates for the DV, matching what
+        // the catalog commit path would produce after writing the
+        // puffin file.
+        let mut dv_locs = HashMap::new();
+        dv_locs.insert(
+            "data/L0/a.parquet".to_string(),
+            DvLocation {
+                dv_path: "data/L0/a.dv-2.puffin".to_string(),
+                dv_offset: 4,
+                dv_length: 24,
+            },
+        );
+        let m2 = m.apply(&txn, 2, &dv_locs).unwrap();
         assert_eq!(m2.live_file_count(), 2);
-        // L0 file still exists but now has a DV path.
+        // L0 file still exists and carries the REAL DV coordinates
+        // (not placeholder zeros — regression for the bug where apply
+        // stamped (0, 0) and every deleted row reappeared on reload).
         let l0_entry = m2
             .entries
             .iter()
             .find(|e| e.path == "data/L0/a.parquet")
             .unwrap();
-        assert!(l0_entry.dv_path.is_some());
+        assert_eq!(
+            l0_entry.dv_path.as_deref(),
+            Some("data/L0/a.dv-2.puffin"),
+            "dv_path must come from the location map, not be reconstructed"
+        );
+        assert_eq!(l0_entry.dv_offset, Some(4));
+        assert_eq!(l0_entry.dv_length, Some(24));
+        // Mirrored into the embedded ParquetFileMeta so both the
+        // manifest view and the file-level view agree.
+        assert_eq!(l0_entry.meta.dv_offset, Some(4));
+        assert_eq!(l0_entry.meta.dv_length, Some(24));
+    }
+
+    /// `apply` must refuse to stamp a DV whose on-storage location has
+    /// not been provided. Previously it silently filled in zeros; the
+    /// zeros then made it to disk and every deleted row came back
+    /// after reload. This test pins the refusal.
+    #[test]
+    fn apply_errors_when_dv_location_missing() {
+        let mut m = Manifest::empty(test_schema());
+        m.entries.push(ManifestEntry {
+            path: "data/L0/a.parquet".into(),
+            meta: test_meta(0, 1, 10, b"\x01", b"\x05"),
+            dv_path: None,
+            dv_offset: None,
+            dv_length: None,
+            status: "existing".into(),
+        });
+
+        let mut txn = SnapshotTransaction::new();
+        let mut dv = DeletionVector::new();
+        dv.mark_deleted(0);
+        txn.add_dv("data/L0/a.parquet".into(), dv);
+
+        let err = m.apply(&txn, 2, &HashMap::new()).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("data/L0/a.parquet") && msg.contains("dv_locations"),
+            "error must name the missing file and the missing map: {msg}"
+        );
     }
 
     #[test]
