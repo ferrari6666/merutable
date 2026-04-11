@@ -74,6 +74,33 @@ fn open_source_file(
     Ok((reader, dv))
 }
 
+/// Compute the union `[key_min, key_max]` range across a set of files.
+/// Returns `(None, None)` if the set is empty. Files whose own `key_min`/
+/// `key_max` are empty (unbounded) are treated as such — `key_min == []`
+/// contributes the lexicographically smallest possible value (shrinks
+/// `union_min` to `[]`), and `key_max == []` is treated as
+/// "no upper bound known" and expands `union_max` to `[0xFF; ...]` by
+/// clearing it. In practice every real file carries concrete bounds.
+fn compute_union_range(files: &[DataFileMeta]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let mut union_min: Option<Vec<u8>> = None;
+    let mut union_max: Option<Vec<u8>> = None;
+    for f in files {
+        let km = &f.meta.key_min;
+        let kx = &f.meta.key_max;
+        match &union_min {
+            None => union_min = Some(km.clone()),
+            Some(cur) if km.as_slice() < cur.as_slice() => union_min = Some(km.clone()),
+            _ => {}
+        }
+        match &union_max {
+            None => union_max = Some(kx.clone()),
+            Some(cur) if kx.as_slice() > cur.as_slice() => union_max = Some(kx.clone()),
+            _ => {}
+        }
+    }
+    (union_min, union_max)
+}
+
 /// Run one compaction job. Picks the best level and compacts.
 pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
     let version = engine.version_set.current();
@@ -103,12 +130,60 @@ pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
         return Ok(());
     }
 
-    // Read every source file, applying its current Deletion Vector so
-    // already-promoted rows don't re-enter the output. Row positions are
-    // the file-global physical positions (u32) that DV stamping expects.
+    // ── Overlap pull-in: include every output-level file whose key range
+    // intersects the union key range of `input_file_metas`. ──
+    //
+    // Classic leveled compaction invariant: L1+ must be non-overlapping
+    // within each level so `find_file_for_key` can binary-search to a
+    // single covering file. If a compaction writes a new L(k+1) file from
+    // L(k) inputs WITHOUT rewriting the existing L(k+1) files that cover
+    // the same keys, the new file overlaps the old ones and the point
+    // lookup path silently returns stale data from the wrong file
+    // (regression: `l1_overlap_regression::overlapping_l1_files_serve_correct_version_on_get`).
+    //
+    // Fix: compute the union key range of the primary inputs, then pull
+    // every output-level file whose `[key_min, key_max]` intersects that
+    // union into the compaction as additional inputs. They are read,
+    // merged with full MVCC+dedup, and rewritten as part of the single
+    // output file — leaving L(k+1) non-overlapping by construction.
+    let (union_min, union_max) = compute_union_range(&input_file_metas);
+    let overlap_output_metas: Vec<DataFileMeta> = if let (Some(umin), Some(umax)) =
+        (union_min.as_ref(), union_max.as_ref())
+    {
+        version
+            .files_at(pick.output_level)
+            .iter()
+            .filter(|f| {
+                // Overlap iff `f.key_min <= umax && f.key_max >= umin`.
+                (f.meta.key_min.is_empty() || f.meta.key_min.as_slice() <= umax.as_slice())
+                    && (f.meta.key_max.is_empty() || f.meta.key_max.as_slice() >= umin.as_slice())
+            })
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if !overlap_output_metas.is_empty() {
+        info!(
+            output_level = pick.output_level.0,
+            overlap_count = overlap_output_metas.len(),
+            "pulling overlapping output-level files into compaction to preserve non-overlap invariant"
+        );
+    }
+
+    // Read every source file (primary inputs + overlap pull-ins), applying
+    // each file's current Deletion Vector so already-promoted rows don't
+    // re-enter the output. Row positions are file-global physical positions
+    // (u32) that DV stamping expects. `file_idx` is a dense index into the
+    // combined list so `CompactionIterator` can disambiguate rows.
     let base = engine.catalog.base_path();
-    let mut file_entries: Vec<FileEntries> = Vec::with_capacity(input_file_metas.len());
-    for (file_idx, file_meta) in input_file_metas.iter().enumerate() {
+    let all_source_metas: Vec<&DataFileMeta> = input_file_metas
+        .iter()
+        .chain(overlap_output_metas.iter())
+        .collect();
+    let mut file_entries: Vec<FileEntries> = Vec::with_capacity(all_source_metas.len());
+    for (file_idx, file_meta) in all_source_metas.iter().enumerate() {
         let (reader, dv) = open_source_file(base, file_meta, engine.schema.clone())?;
         let physical = reader.read_physical_rows_with_positions(dv.as_ref())?;
         file_entries.push(FileEntries {
@@ -227,8 +302,13 @@ pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
         });
     }
 
-    // Remove every fully-consumed input file.
+    // Remove every fully-consumed input file — primary inputs AND the
+    // overlap pull-ins from the output level, which were fully read and
+    // rewritten above.
     for file_meta in &input_file_metas {
+        txn.remove_file(file_meta.path.clone());
+    }
+    for file_meta in &overlap_output_metas {
         txn.remove_file(file_meta.path.clone());
     }
 
