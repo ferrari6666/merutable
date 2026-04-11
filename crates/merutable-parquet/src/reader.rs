@@ -26,6 +26,7 @@ use roaring::RoaringBitmap;
 use crate::{
     bloom::FastLocalBloom,
     codec::{self, IKEY_COLUMN_NAME, VALUE_BLOB_COLUMN_NAME},
+    footer::decode_footer_kv,
     kv_index::{KvSparseIndex, PageLocation, KV_INDEX_FOOTER_KEY},
 };
 
@@ -62,24 +63,15 @@ impl<R: ChunkReader + Clone + 'static> ParquetReader<R> {
             })
             .unwrap_or_default();
 
-        let meta = if let Some(meta_json) = kv_map.get(merutable_types::level::FOOTER_KEY) {
-            serde_json::from_str(meta_json)
-                .map_err(|e| MeruError::Corruption(format!("footer parse: {e}")))?
-        } else {
-            // No footer key — construct minimal meta from file metadata.
-            ParquetFileMeta {
-                level: merutable_types::level::Level(0),
-                seq_min: 0,
-                seq_max: 0,
-                key_min: Vec::new(),
-                key_max: Vec::new(),
-                num_rows: file_reader.metadata().file_metadata().num_rows() as u64,
-                file_size: 0,
-                dv_path: None,
-                dv_offset: None,
-                dv_length: None,
-            }
-        };
+        // Decode the merutable-specific footer KV pair (meta + embedded
+        // schema) through the canonical decoder. This errors cleanly on
+        // any missing or corrupt entry — previously this code inlined a
+        // partial parser that silently fabricated a fake `ParquetFileMeta`
+        // on a missing `merutable.meta` key, masking real corruption.
+        // We drop the embedded schema here because the caller-provided
+        // `schema` is authoritative; a follow-up could cross-check them
+        // to detect schema drift.
+        let (meta, _embedded_schema) = decode_footer_kv(&kv_map)?;
 
         // Load bloom filter from "merutable.bloom" KV entry.
         let bloom = kv_map.get("merutable.bloom").and_then(|hex_str| {
