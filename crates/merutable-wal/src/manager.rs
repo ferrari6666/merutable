@@ -124,7 +124,7 @@ impl WalManager {
         for (log_num, path) in log_files {
             info!(log_num, path = %path.display(), "recovering WAL");
             let source = FileSource::open(&path)?;
-            let mut reader = WalReader::new(source, false);
+            let mut reader = WalReader::new(source);
             for record in reader.records() {
                 match record {
                     Ok(payload) => {

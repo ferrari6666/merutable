@@ -78,16 +78,41 @@ pub struct WalReader {
     file_offset: u64,
     block_offset: usize,
     recyclable: bool,
+    /// Expected log number for the *recyclable* format. When `recyclable`
+    /// is true, every physical record's embedded `log_number` must equal
+    /// this value; a mismatch means the record belongs to a previous
+    /// generation of a recycled file and the reader treats it as a clean
+    /// EOF. Ignored when `recyclable` is false.
+    expected_log_number: u32,
     eof: bool,
 }
 
 impl WalReader {
-    pub fn new<S: WalSource + 'static>(source: S, recyclable: bool) -> Self {
+    /// Construct a non-recyclable reader. The reader will emit standard
+    /// 7-byte headers and will not validate any log_number field.
+    pub fn new<S: WalSource + 'static>(source: S) -> Self {
         Self {
             source: Box::new(source),
             file_offset: 0,
             block_offset: 0,
-            recyclable,
+            recyclable: false,
+            expected_log_number: 0,
+            eof: false,
+        }
+    }
+
+    /// Construct a recyclable reader. Every physical record's embedded
+    /// `log_number` must equal `expected_log_number`; records from an
+    /// older generation (stale bytes left over in a recycled file) are
+    /// detected via the mismatch and the reader stops cleanly at that
+    /// point, exactly as RocksDB does.
+    pub fn new_recyclable<S: WalSource + 'static>(source: S, expected_log_number: u32) -> Self {
+        Self {
+            source: Box::new(source),
+            file_offset: 0,
+            block_offset: 0,
+            recyclable: true,
+            expected_log_number,
             eof: false,
         }
     }
@@ -208,6 +233,27 @@ impl WalReader {
 
         let rtype = RecordType::from_byte(type_byte)
             .ok_or_else(|| MeruError::Corruption(format!("unknown record type {type_byte:#x}")))?;
+
+        // Recyclable format carries a 4-byte log number after the type
+        // byte. A mismatch means the record is left over from a previous
+        // generation of a recycled log file; signal as clean EOF so the
+        // caller stops recovery here (matches RocksDB's semantics).
+        if self.recyclable {
+            if !rtype.is_recyclable() {
+                return Err(MeruError::Corruption(format!(
+                    "non-recyclable record type {type_byte:#x} in recyclable log"
+                )));
+            }
+            let embedded_log =
+                u32::from_le_bytes(header[7..RECYCLABLE_HEADER_SIZE].try_into().unwrap());
+            if embedded_log != self.expected_log_number {
+                return Ok(None);
+            }
+        } else if rtype.is_recyclable() {
+            return Err(MeruError::Corruption(format!(
+                "recyclable record type {type_byte:#x} in non-recyclable log"
+            )));
+        }
 
         // Read payload.
         let payload_offset = self.file_offset + header_size as u64;

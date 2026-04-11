@@ -10,7 +10,7 @@ use std::io::Write;
 use crc32fast::Hasher as Crc32;
 use merutable_types::{MeruError, Result};
 
-use crate::format::{RecordType, BLOCK_SIZE, HEADER_SIZE, MIN_REMAINING};
+use crate::format::{RecordType, BLOCK_SIZE, HEADER_SIZE, RECYCLABLE_HEADER_SIZE};
 
 /// Pluggable WAL sink. Local filesystem: `std::fs::File`.
 /// Distributed/consensus WAL: implement this trait (e.g., Raft append log).
@@ -76,22 +76,23 @@ impl WalWriter {
         let mut remaining = payload;
         let mut is_first = true;
 
+        let header_size = self.effective_header_size();
+
         while !remaining.is_empty() {
             let available = self.available_in_block();
 
             // If the block can't even fit a header, pad with zeros and start a new one.
-            if available < MIN_REMAINING {
+            // Note: the threshold must be the *effective* header size — recyclable
+            // format needs 11 bytes, non-recyclable 7. A 7-byte threshold on a
+            // recyclable writer with 8..=10 bytes remaining would underflow
+            // `capacity = available - header_size` below.
+            if available < header_size {
                 let pad = vec![0u8; available];
                 self.sink.append(&pad)?;
                 self.block_offset = 0;
             }
 
             let available = self.available_in_block();
-            let header_size = if self.recyclable {
-                crate::format::RECYCLABLE_HEADER_SIZE
-            } else {
-                HEADER_SIZE
-            };
             let capacity = available - header_size;
             let fragment = &remaining[..remaining.len().min(capacity)];
             remaining = &remaining[fragment.len()..];
@@ -142,13 +143,17 @@ impl WalWriter {
         BLOCK_SIZE - self.block_offset
     }
 
-    fn emit_physical_record(&mut self, rtype: RecordType, payload: &[u8]) -> Result<()> {
-        debug_assert!(payload.len() <= u16::MAX as usize);
-        let header_size = if self.recyclable {
-            crate::format::RECYCLABLE_HEADER_SIZE
+    fn effective_header_size(&self) -> usize {
+        if self.recyclable {
+            RECYCLABLE_HEADER_SIZE
         } else {
             HEADER_SIZE
-        };
+        }
+    }
+
+    fn emit_physical_record(&mut self, rtype: RecordType, payload: &[u8]) -> Result<()> {
+        debug_assert!(payload.len() <= u16::MAX as usize);
+        let header_size = self.effective_header_size();
 
         // CRC covers: [type_byte ++ payload].
         let mut hasher = Crc32::new();
@@ -208,7 +213,7 @@ mod tests {
         let payload = b"hello merutable";
         writer.add_record(payload).unwrap();
         let data = buf.lock().unwrap().clone();
-        let mut reader = WalReader::new(VecSource::new(data), false);
+        let mut reader = WalReader::new(VecSource::new(data));
         let records: Vec<_> = reader.records().collect();
         assert_eq!(records.len(), 1);
         assert_eq!(&records[0].as_ref().unwrap()[..], payload);
@@ -222,7 +227,7 @@ mod tests {
             writer.add_record(p).unwrap();
         }
         let data = buf.lock().unwrap().clone();
-        let mut reader = WalReader::new(VecSource::new(data), false);
+        let mut reader = WalReader::new(VecSource::new(data));
         let records: Vec<_> = reader.records().map(|r| r.unwrap()).collect();
         assert_eq!(records.len(), payloads.len());
         for (got, expected) in records.iter().zip(payloads.iter()) {
@@ -237,7 +242,7 @@ mod tests {
         let payload = vec![0xAAu8; BLOCK_SIZE + 100];
         writer.add_record(&payload).unwrap();
         let data = buf.lock().unwrap().clone();
-        let mut reader = WalReader::new(VecSource::new(data), false);
+        let mut reader = WalReader::new(VecSource::new(data));
         let records: Vec<_> = reader.records().map(|r| r.unwrap()).collect();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0], payload);
@@ -248,9 +253,83 @@ mod tests {
         let (mut writer, buf) = make_writer(true);
         writer.add_record(b"recyclable test").unwrap();
         let data = buf.lock().unwrap().clone();
-        let mut reader = WalReader::new(VecSource::new(data), true);
+        // make_writer uses log_number = 1; the reader must assert the
+        // same value to validate the embedded log_number check.
+        let mut reader = WalReader::new_recyclable(VecSource::new(data), 1);
         let records: Vec<_> = reader.records().map(|r| r.unwrap()).collect();
         assert_eq!(records.len(), 1);
         assert_eq!(&records[0][..], b"recyclable test");
+    }
+
+    /// Regression for a writer bug where `MIN_REMAINING = HEADER_SIZE = 7`
+    /// was used unconditionally — when a recyclable writer had 7..=10 bytes
+    /// remaining in the current block, padding was skipped and then
+    /// `capacity = available - 11` underflowed (panic in debug, wrap in
+    /// release). The fix pads when `available < effective_header_size`.
+    #[test]
+    fn recyclable_padding_respects_11_byte_header() {
+        // Craft a payload that lands the writer with exactly 8 bytes
+        // remaining in the current block. An 11-byte recyclable header
+        // then cannot fit, so the writer must pad.
+        //
+        // First record consumes BLOCK_SIZE - 8 bytes on disk. With an
+        // 11-byte header, the payload must be BLOCK_SIZE - 8 - 11 = 32749.
+        let (mut writer, buf) = make_writer(true);
+        let first = vec![0x5Au8; BLOCK_SIZE - 8 - 11];
+        writer.add_record(&first).unwrap();
+        // Second record is small and would have underflown capacity on
+        // the buggy path. On the fixed path it pads the 8-byte tail with
+        // zeros, starts a new block, and writes a RecyclableFull record.
+        let second = b"after-tail";
+        writer.add_record(second).unwrap();
+
+        let data = buf.lock().unwrap().clone();
+        // File must contain at least one full block of padding (first
+        // record + 8 zero tail bytes) plus the second record in block 2.
+        assert!(data.len() >= BLOCK_SIZE + 11 + second.len());
+        // The 8 bytes immediately before block 2 must be zero padding.
+        let pad_start = BLOCK_SIZE - 8;
+        assert!(
+            data[pad_start..BLOCK_SIZE].iter().all(|&b| b == 0),
+            "block 1 tail must be zero-padded; got {:x?}",
+            &data[pad_start..BLOCK_SIZE]
+        );
+
+        let mut reader = WalReader::new_recyclable(VecSource::new(data), 1);
+        let records: Vec<_> = reader.records().map(|r| r.unwrap()).collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], first);
+        assert_eq!(&records[1][..], second);
+    }
+
+    /// A recyclable reader configured with `expected_log_number = 7` must
+    /// treat records written with `log_number = 1` as stale (clean EOF),
+    /// NOT silently return their payloads as if they were live. This is
+    /// the entire point of the recyclable format.
+    #[test]
+    fn recyclable_reader_rejects_stale_log_number() {
+        let (mut writer, buf) = make_writer(true); // writer uses log_number=1
+        writer.add_record(b"stale bytes").unwrap();
+        let data = buf.lock().unwrap().clone();
+        let mut reader = WalReader::new_recyclable(VecSource::new(data), 7);
+        let records: Vec<_> = reader.records().collect();
+        assert!(
+            records.is_empty(),
+            "stale recyclable records must not be surfaced"
+        );
+    }
+
+    /// A non-recyclable reader fed a recyclable-format log must refuse
+    /// the type byte rather than silently mis-parsing the 11-byte header
+    /// as a 7-byte header.
+    #[test]
+    fn non_recyclable_reader_rejects_recyclable_records() {
+        let (mut writer, buf) = make_writer(true); // recyclable format
+        writer.add_record(b"recyc payload").unwrap();
+        let data = buf.lock().unwrap().clone();
+        let mut reader = WalReader::new(VecSource::new(data));
+        let records: Vec<_> = reader.records().collect();
+        // Reader stops cleanly (no panic, no surfacing of wrong bytes).
+        assert!(records.is_empty());
     }
 }
