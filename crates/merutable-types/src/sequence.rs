@@ -52,6 +52,18 @@ impl GlobalSeq {
         SeqNum(self.0.fetch_add(1, Ordering::AcqRel))
     }
 
+    /// Atomically reserve `n` consecutive sequence numbers. Returns the
+    /// **first** seq in the reserved range; the caller owns `[base, base+n)`.
+    /// Required for multi-record batch writes: the memtable's `apply_batch`
+    /// consumes one seq per record, so the global counter must be bumped by
+    /// the full record count — not by 1, or else the next allocation collides
+    /// with a record already written by the batch and crossbeam_skiplist's
+    /// `insert` silently overwrites one of the two entries.
+    #[inline]
+    pub fn allocate_n(&self, n: u64) -> SeqNum {
+        SeqNum(self.0.fetch_add(n, Ordering::AcqRel))
+    }
+
     /// Overwrite (called during WAL recovery to advance past recovered max seq).
     pub fn set_at_least(&self, val: u64) {
         // CAS loop to set only if val > current, avoiding races with in-flight writes.
@@ -109,6 +121,27 @@ mod tests {
         assert_eq!(s2, SeqNum(2));
         assert_eq!(s3, SeqNum(3));
         assert_eq!(gs.current(), SeqNum(4));
+    }
+
+    #[test]
+    fn global_seq_allocate_n_reserves_contiguous_range() {
+        let gs = GlobalSeq::new(10);
+        let base = gs.allocate_n(4);
+        // Caller owns [base, base+4) = [10, 11, 12, 13].
+        assert_eq!(base, SeqNum(10));
+        // Next single allocate must skip over the reserved range.
+        assert_eq!(gs.allocate(), SeqNum(14));
+        // And a further batch must start where the single left off.
+        assert_eq!(gs.allocate_n(2), SeqNum(15));
+        assert_eq!(gs.current(), SeqNum(17));
+    }
+
+    #[test]
+    fn global_seq_allocate_n_zero_is_noop() {
+        let gs = GlobalSeq::new(5);
+        let base = gs.allocate_n(0);
+        assert_eq!(base, SeqNum(5));
+        assert_eq!(gs.current(), SeqNum(5));
     }
 
     #[test]

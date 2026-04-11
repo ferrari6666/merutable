@@ -78,14 +78,23 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
         engine.memtable.flush_complete.notified().await;
     }
 
-    // Allocate a base seq for the entire batch.
-    let base_seq = engine.global_seq.allocate();
+    // Reserve one seq per record up front. The memtable's `apply_batch`
+    // consumes seqs incrementally (`seq, seq+1, …, seq+N-1`), so the global
+    // counter MUST be advanced by the full record count. If we only
+    // `allocate()` once, the next writer's allocation collides with the
+    // tail of this batch — crossbeam_skiplist's `insert` then silently
+    // overwrites one of the two entries at (same user_key, same seq) and
+    // drops a record. Bug A regression: `apply_batch_advances_seq_by_record_count`.
+    let base_seq = engine.global_seq.allocate_n(batch.ops.len() as u64);
     let mut wal_batch = WriteBatch::new(base_seq);
 
-    for mutation in &batch.ops {
+    for (i, mutation) in batch.ops.iter().enumerate() {
+        // Per-record seq: base_seq + i. This matches what
+        // `Memtable::apply_batch` will stamp into the skiplist.
+        let record_seq = SeqNum(base_seq.0 + i as u64);
         let ikey = InternalKey::encode(
             &mutation.pk_values,
-            base_seq,
+            record_seq,
             mutation.op_type,
             &engine.schema,
         )?;
@@ -234,6 +243,199 @@ mod tests {
         assert!(row1.is_some());
         let row2 = engine.get(&[FieldValue::Int64(99)]).unwrap();
         assert!(row2.is_some());
+    }
+
+    /// Regression: a multi-record `MutationBatch` must advance `global_seq`
+    /// by exactly `batch.len()` — not by 1. The memtable's own `apply_batch`
+    /// stamps each record at `base, base+1, …, base+N-1`, so if the write
+    /// path only calls `allocate()` once, the next writer collides with the
+    /// tail of the batch in the skiplist. crossbeam_skiplist's `insert`
+    /// silently overwrites on duplicate-key collision, dropping a record
+    /// without any error — this is a data-loss bug.
+    #[tokio::test]
+    async fn apply_batch_advances_seq_by_record_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::config::EngineConfig {
+            schema: test_schema(),
+            catalog_uri: tmp.path().to_string_lossy().to_string(),
+            object_store_prefix: tmp.path().to_string_lossy().to_string(),
+            wal_dir: tmp.path().join("wal"),
+            ..Default::default()
+        };
+        let engine = crate::engine::MeruEngine::open(config).await.unwrap();
+
+        let seq_before = engine.read_seq().0;
+
+        // 4-record batch. All distinct keys.
+        let mut batch = MutationBatch::new();
+        for i in 1..=4i64 {
+            batch.put(
+                vec![FieldValue::Int64(i)],
+                Row::new(vec![
+                    Some(FieldValue::Int64(i)),
+                    Some(FieldValue::Bytes(bytes::Bytes::from(format!("batch_{i}")))),
+                ]),
+            );
+        }
+        let base_seq = apply_batch(&engine, batch).await.unwrap();
+        assert_eq!(
+            base_seq.0, seq_before,
+            "batch should start at the pre-batch counter value"
+        );
+
+        // After a 4-record batch, global_seq MUST have advanced by 4.
+        let seq_after = engine.read_seq().0;
+        assert_eq!(
+            seq_after,
+            seq_before + 4,
+            "4-record batch must advance global_seq by 4, not 1; before={seq_before} after={seq_after}"
+        );
+
+        // And the next single put MUST get a seq strictly greater than the
+        // tail of the batch (base_seq + 3).
+        let s5 = engine
+            .put(
+                vec![FieldValue::Int64(5)],
+                Row::new(vec![
+                    Some(FieldValue::Int64(5)),
+                    Some(FieldValue::Bytes(bytes::Bytes::from("single_5"))),
+                ]),
+            )
+            .await
+            .unwrap();
+        assert!(
+            s5.0 > base_seq.0 + 3,
+            "single put after 4-record batch must have seq > base+3: base={} s5={}",
+            base_seq.0,
+            s5.0
+        );
+    }
+
+    /// Regression: after a multi-record batch, a subsequent put of a NEW
+    /// key must not silently overwrite any of the batch's records. This is
+    /// the user-observable face of Bug A — with the old `allocate()` code,
+    /// the single put collided in the skiplist at (different user_key, same
+    /// seq)... and while that specific collision doesn't shadow data, the
+    /// invariant "every batch record is readable at the correct value" must
+    /// hold regardless of the allocation strategy.
+    #[tokio::test]
+    async fn apply_batch_then_single_put_all_values_survive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::config::EngineConfig {
+            schema: test_schema(),
+            catalog_uri: tmp.path().to_string_lossy().to_string(),
+            object_store_prefix: tmp.path().to_string_lossy().to_string(),
+            wal_dir: tmp.path().join("wal"),
+            ..Default::default()
+        };
+        let engine = crate::engine::MeruEngine::open(config).await.unwrap();
+
+        let mut batch = MutationBatch::new();
+        for i in 1..=3i64 {
+            batch.put(
+                vec![FieldValue::Int64(i)],
+                Row::new(vec![
+                    Some(FieldValue::Int64(i)),
+                    Some(FieldValue::Bytes(bytes::Bytes::from(format!("batch_v{i}")))),
+                ]),
+            );
+        }
+        apply_batch(&engine, batch).await.unwrap();
+
+        engine
+            .put(
+                vec![FieldValue::Int64(4)],
+                Row::new(vec![
+                    Some(FieldValue::Int64(4)),
+                    Some(FieldValue::Bytes(bytes::Bytes::from("single_v4"))),
+                ]),
+            )
+            .await
+            .unwrap();
+
+        for (id, expected) in [
+            (1i64, "batch_v1"),
+            (2, "batch_v2"),
+            (3, "batch_v3"),
+            (4, "single_v4"),
+        ] {
+            let row = engine
+                .get(&[FieldValue::Int64(id)])
+                .unwrap()
+                .unwrap_or_else(|| panic!("id {id} missing after batch+single put"));
+            let got = row.get(1).cloned();
+            assert_eq!(
+                got,
+                Some(FieldValue::Bytes(bytes::Bytes::from(expected))),
+                "value mismatch for id {id}"
+            );
+        }
+    }
+
+    /// Regression: two sequential multi-record batches must leave the
+    /// skiplist with exactly `batch1.len() + batch2.len()` logical entries
+    /// (no silent overwrite where the second batch's base seq collides with
+    /// the first batch's tail). This is the scenario that triggered the
+    /// original bug in production workloads that mix batches and singles.
+    #[tokio::test]
+    async fn two_consecutive_batches_preserve_all_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::config::EngineConfig {
+            schema: test_schema(),
+            catalog_uri: tmp.path().to_string_lossy().to_string(),
+            object_store_prefix: tmp.path().to_string_lossy().to_string(),
+            wal_dir: tmp.path().join("wal"),
+            ..Default::default()
+        };
+        let engine = crate::engine::MeruEngine::open(config).await.unwrap();
+
+        // Batch 1: keys 1..=5, values "b1_N".
+        let mut b1 = MutationBatch::new();
+        for i in 1..=5i64 {
+            b1.put(
+                vec![FieldValue::Int64(i)],
+                Row::new(vec![
+                    Some(FieldValue::Int64(i)),
+                    Some(FieldValue::Bytes(bytes::Bytes::from(format!("b1_{i}")))),
+                ]),
+            );
+        }
+        apply_batch(&engine, b1).await.unwrap();
+
+        // Batch 2: keys 6..=10, values "b2_N".
+        let mut b2 = MutationBatch::new();
+        for i in 6..=10i64 {
+            b2.put(
+                vec![FieldValue::Int64(i)],
+                Row::new(vec![
+                    Some(FieldValue::Int64(i)),
+                    Some(FieldValue::Bytes(bytes::Bytes::from(format!("b2_{i}")))),
+                ]),
+            );
+        }
+        apply_batch(&engine, b2).await.unwrap();
+
+        // All 10 keys must be readable with their correct values.
+        for i in 1..=5i64 {
+            let row = engine.get(&[FieldValue::Int64(i)]).unwrap().unwrap();
+            assert_eq!(
+                row.get(1).cloned(),
+                Some(FieldValue::Bytes(bytes::Bytes::from(format!("b1_{i}")))),
+                "batch 1 value missing/corrupt at id {i}"
+            );
+        }
+        for i in 6..=10i64 {
+            let row = engine.get(&[FieldValue::Int64(i)]).unwrap().unwrap();
+            assert_eq!(
+                row.get(1).cloned(),
+                Some(FieldValue::Bytes(bytes::Bytes::from(format!("b2_{i}")))),
+                "batch 2 value missing/corrupt at id {i}"
+            );
+        }
+
+        // Full scan must return exactly 10 distinct rows.
+        let scan = engine.scan(None, None).unwrap();
+        assert_eq!(scan.len(), 10, "scan should see all 10 distinct keys");
     }
 
     #[tokio::test]
