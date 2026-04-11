@@ -2,7 +2,9 @@
 //!
 //! Sequence:
 //! 1. Pick compaction (level, input files).
-//! 2. Read input files (TODO: via ParquetReader with DV applied).
+//! 2. Read input files via `ParquetReader::read_physical_rows_with_positions`,
+//!    applying each source file's existing Deletion Vector loaded from its
+//!    Puffin blob at the manifest-recorded byte range.
 //! 3. Merge via `CompactionIterator` (dedup, tombstone drop).
 //! 4. Write output files at the target level.
 //! 5. Track promoted row positions for DV updates.
@@ -10,10 +12,15 @@
 //! 7. Commit Iceberg snapshot.
 //! 8. Install new version.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{path::Path, sync::Arc};
 
-use merutable_iceberg::{DeletionVector, IcebergDataFile, SnapshotTransaction};
-use merutable_types::{level::ParquetFileMeta, MeruError, Result};
+use bytes::Bytes;
+use merutable_iceberg::{
+    version::DataFileMeta, DeletionVector, IcebergDataFile, SnapshotTransaction,
+};
+use merutable_parquet::reader::ParquetReader;
+use merutable_types::{level::ParquetFileMeta, schema::TableSchema, MeruError, Result};
+use roaring::RoaringBitmap;
 use tracing::{debug, info};
 
 use crate::{
@@ -23,6 +30,49 @@ use crate::{
     },
     engine::MeruEngine,
 };
+
+/// Open a source Parquet file and load its Deletion Vector (if any) from
+/// the companion Puffin blob at the exact manifest-recorded byte range.
+/// Kept local to the compaction module so the read path can keep its own
+/// equivalent helper without risking circular visibility; both are thin
+/// wrappers over `ParquetReader::open` + `DeletionVector::from_puffin_blob`.
+fn open_source_file(
+    base: &Path,
+    file: &DataFileMeta,
+    schema: Arc<TableSchema>,
+) -> Result<(ParquetReader<Bytes>, Option<RoaringBitmap>)> {
+    let abs_parquet = base.join(&file.path);
+    let parquet_bytes = std::fs::read(&abs_parquet).map_err(MeruError::Io)?;
+    let reader = ParquetReader::open(Bytes::from(parquet_bytes), schema)?;
+
+    let dv = match (&file.dv_path, file.dv_offset, file.dv_length) {
+        (Some(dv_path), Some(offset), Some(length)) => {
+            let abs_dv = base.join(dv_path);
+            let puffin_bytes = std::fs::read(&abs_dv).map_err(MeruError::Io)?;
+            let start = offset as usize;
+            let end = start
+                .checked_add(length as usize)
+                .ok_or_else(|| MeruError::Corruption("DV offset+length overflow".into()))?;
+            if end > puffin_bytes.len() {
+                return Err(MeruError::Corruption(format!(
+                    "DV blob out of range: path={dv_path} offset={offset} length={length} puffin_len={}",
+                    puffin_bytes.len()
+                )));
+            }
+            let dv = DeletionVector::from_puffin_blob(&puffin_bytes[start..end])?;
+            Some(dv.bitmap().clone())
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(MeruError::Corruption(format!(
+                "inconsistent DV coords on file {}: dv_path={:?} dv_offset={:?} dv_length={:?}",
+                file.path, file.dv_path, file.dv_offset, file.dv_length
+            )));
+        }
+    };
+
+    Ok((reader, dv))
+}
 
 /// Run one compaction job. Picks the best level and compacts.
 pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
@@ -43,10 +93,29 @@ pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
         "starting compaction"
     );
 
-    // Collect input file entries.
-    // TODO: Read from actual Parquet files via ParquetReader.
-    // For now, create an empty compaction since ParquetReader isn't fully wired.
-    let file_entries: Vec<FileEntries> = Vec::new();
+    // Snapshot the version once so every subsequent index into
+    // `files_at(input_level)` refers to the same file list used when
+    // building `FileEntries` below.
+    let version = engine.version_set.current();
+    let input_file_metas: Vec<DataFileMeta> = version.files_at(pick.input_level).to_vec();
+    if input_file_metas.is_empty() {
+        debug!("compaction picked an empty input level");
+        return Ok(());
+    }
+
+    // Read every source file, applying its current Deletion Vector so
+    // already-promoted rows don't re-enter the output. Row positions are
+    // the file-global physical positions (u32) that DV stamping expects.
+    let base = engine.catalog.base_path();
+    let mut file_entries: Vec<FileEntries> = Vec::with_capacity(input_file_metas.len());
+    for (file_idx, file_meta) in input_file_metas.iter().enumerate() {
+        let (reader, dv) = open_source_file(base, file_meta, engine.schema.clone())?;
+        let physical = reader.read_physical_rows_with_positions(dv.as_ref())?;
+        file_entries.push(FileEntries {
+            file_idx,
+            entries: physical,
+        });
+    }
 
     // Build compaction iterator.
     let read_seq = engine.read_seq();
@@ -54,46 +123,80 @@ pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
     let iter = CompactionIterator::new(file_entries, read_seq, drop_tombstones);
 
     if iter.is_empty() {
-        // If we can't read files yet, at least build the transaction structure.
-        // This path will be fully functional when ParquetReader is wired up.
-        debug!("compaction produced no output (reader not wired)");
-        return Ok(());
+        // All inputs were tombstones dropped at the bottom level, or every
+        // row was already DV-masked. Still install an empty transaction so
+        // the source files can be removed.
+        debug!(
+            input_level = pick.input_level.0,
+            "compaction produced no output rows"
+        );
     }
 
-    // Collect surviving entries and track promoted rows per source file.
+    // Collect surviving entries. Since this path always reads every
+    // physical row of every input file (see the `read_physical_rows_*`
+    // call above), every input file is fully consumed and will be removed
+    // from the manifest below. A future partial-compaction mode could
+    // re-introduce per-file DV stamping, but the current model is
+    // full-level in → full-level out, so tracking "promoted" positions is
+    // redundant — and the old path was buggy because it only marked
+    // *winner* positions, leaving deduped-away older duplicates in the
+    // source file for the read path to rediscover.
     let mut output_rows: Vec<(
         merutable_types::key::InternalKey,
         merutable_types::value::Row,
     )> = Vec::new();
-    let mut promoted_per_file: HashMap<usize, Vec<u32>> = HashMap::new();
+    let mut seq_min: u64 = u64::MAX;
+    let mut seq_max: u64 = 0;
+    let mut key_min: Option<Vec<u8>> = None;
+    let mut key_max: Option<Vec<u8>> = None;
 
     for entry in iter {
+        let uk = entry.ikey.user_key_bytes().to_vec();
+        let s = entry.ikey.seq.0;
+        if s < seq_min {
+            seq_min = s;
+        }
+        if s > seq_max {
+            seq_max = s;
+        }
+        match &key_min {
+            Some(k) if k.as_slice() <= uk.as_slice() => {}
+            _ => key_min = Some(uk.clone()),
+        }
+        match &key_max {
+            Some(k) if k.as_slice() >= uk.as_slice() => {}
+            _ => key_max = Some(uk.clone()),
+        }
         output_rows.push((entry.ikey, entry.row));
-        promoted_per_file
-            .entry(entry.source_file_idx)
-            .or_default()
-            .push(entry.row_position);
     }
 
     let num_output_rows = output_rows.len();
 
-    // Write output Parquet file(s).
-    let file_id = uuid::Uuid::new_v4().to_string();
-    let output_path = format!("data/L{}/{file_id}.parquet", pick.output_level.0);
+    // Build the snapshot transaction up front so we can commit even when
+    // the compaction output is empty (pure tombstone drop at the bottom).
+    let mut txn = SnapshotTransaction::new();
 
-    let (parquet_bytes, _, _) = merutable_parquet::writer::write_sorted_rows(
-        output_rows,
-        engine.schema.clone(),
-        pick.output_level,
-        engine.config.bloom_bits_per_key,
-    )?;
+    if num_output_rows > 0 {
+        // Write output Parquet file.
+        let file_id = uuid::Uuid::new_v4().to_string();
+        let output_path = format!("data/L{}/{file_id}.parquet", pick.output_level.0);
 
-    let file_size = parquet_bytes.len() as u64;
+        let (parquet_bytes, _, _) = merutable_parquet::writer::write_sorted_rows(
+            output_rows,
+            engine.schema.clone(),
+            pick.output_level,
+            engine.config.bloom_bits_per_key,
+        )?;
 
-    // Write to disk.
-    engine.catalog.ensure_level_dir(pick.output_level).await?;
-    let full_path = engine.catalog.data_file_path(pick.output_level, &file_id);
-    if !parquet_bytes.is_empty() {
+        if parquet_bytes.is_empty() {
+            return Err(MeruError::Parquet(
+                "writer returned empty bytes for non-empty row set".into(),
+            ));
+        }
+        let file_size = parquet_bytes.len() as u64;
+
+        engine.catalog.ensure_level_dir(pick.output_level).await?;
+        let full_path = engine.catalog.data_file_path(pick.output_level, &file_id);
         if let Some(parent) = full_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -102,49 +205,31 @@ pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
         tokio::fs::write(&full_path, &parquet_bytes)
             .await
             .map_err(MeruError::Io)?;
+
+        let meta = ParquetFileMeta {
+            level: pick.output_level,
+            seq_min: if seq_min == u64::MAX { 0 } else { seq_min },
+            seq_max,
+            key_min: key_min.unwrap_or_default(),
+            key_max: key_max.unwrap_or_default(),
+            num_rows: num_output_rows as u64,
+            file_size,
+            dv_path: None,
+            dv_offset: None,
+            dv_length: None,
+        };
+
+        txn.add_file(IcebergDataFile {
+            path: output_path,
+            file_size,
+            num_rows: num_output_rows as u64,
+            meta,
+        });
     }
 
-    // Build snapshot transaction.
-    let mut txn = SnapshotTransaction::new();
-
-    // Add output file.
-    let meta = ParquetFileMeta {
-        level: pick.output_level,
-        seq_min: 0, // TODO: track from iterator
-        seq_max: 0,
-        key_min: Vec::new(),
-        key_max: Vec::new(),
-        num_rows: num_output_rows as u64,
-        file_size,
-        dv_path: None,
-        dv_offset: None,
-        dv_length: None,
-    };
-
-    txn.add_file(IcebergDataFile {
-        path: output_path.clone(),
-        file_size,
-        num_rows: num_output_rows as u64,
-        meta,
-    });
-
-    // Build DVs for source files or remove them if fully compacted.
-    let input_files = version.files_at(pick.input_level);
-    for (file_idx, file_meta) in input_files.iter().enumerate() {
-        let promoted = promoted_per_file.get(&file_idx);
-        let promoted_count = promoted.map(|v| v.len() as u64).unwrap_or(0);
-
-        if promoted_count >= file_meta.meta.num_rows {
-            // All rows promoted → remove file from manifest.
-            txn.remove_file(file_meta.path.clone());
-        } else if promoted_count > 0 {
-            // Partial promotion → build DV for promoted positions.
-            let mut dv = DeletionVector::new();
-            for &pos in promoted.unwrap() {
-                dv.mark_deleted(pos);
-            }
-            txn.add_dv(file_meta.path.clone(), dv);
-        }
+    // Remove every fully-consumed input file.
+    for file_meta in &input_file_metas {
+        txn.remove_file(file_meta.path.clone());
     }
 
     txn.set_prop("merutable.job", "compaction");

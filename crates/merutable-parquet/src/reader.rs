@@ -285,6 +285,38 @@ impl<R: ChunkReader + Clone + 'static> ParquetReader<R> {
         &self.meta
     }
 
+    /// Read every physical row in file order, tagged with its file-global
+    /// row position, and filter out any positions masked by `deleted_rows`.
+    ///
+    /// Intended for **compaction** — the compaction iterator needs every
+    /// physical row (no seq/tombstone filtering, because it performs its
+    /// own dedup and tombstone handling) *and* needs the original row
+    /// position so it can later stamp the source file's Deletion Vector.
+    ///
+    /// Internal readers (point lookup, scan) should NOT use this; they
+    /// already do MVCC gating inside `get` / `scan`.
+    pub fn read_physical_rows_with_positions(
+        &self,
+        deleted_rows: Option<&RoaringBitmap>,
+    ) -> Result<Vec<(InternalKey, Row, u32)>> {
+        let rows = self.read_all_rows()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (pos, (ikey, row)) in rows.into_iter().enumerate() {
+            let pos_u32 = u32::try_from(pos).map_err(|_| {
+                MeruError::Parquet(format!(
+                    "row position {pos} exceeds u32::MAX in Parquet file"
+                ))
+            })?;
+            if let Some(dv) = deleted_rows {
+                if dv.contains(pos_u32) {
+                    continue;
+                }
+            }
+            out.push((ikey, row, pos_u32));
+        }
+        Ok(out)
+    }
+
     /// Read every row in the file as a fully-decoded `(InternalKey, Row)`
     /// pair using a column-projected Arrow record-batch reader.
     ///

@@ -4,27 +4,87 @@
 //!
 //! 1. **Memtable** (active → immutable queue, newest first)
 //!    → return immediately if found.
-//! 2. **L0 files** (ALL checked, sorted by seq_max DESC — can overlap)
+//! 2. **L0 files** (ALL checked, sorted by `seq_max` DESC — can overlap)
+//!    → bloom filter gate first; first hit wins (files are already sorted
+//!    newest-first by `Manifest::to_version`).
+//! 3. **L1..LN** (binary search per level by `key_max` — non-overlapping)
 //!    → bloom filter gate first.
-//! 3. **L1..LN** (binary search per level by key_max — non-overlapping)
-//!    → bloom filter gate first.
+//!
+//! Deletion Vectors are loaded from their Puffin blob at the offset/length
+//! recorded in the manifest and passed through to `ParquetReader::get`.
 //!
 //! ## Range scan
 //!
-//! K-way merge of:
-//! - MemtableIterator snapshots (one per memtable)
-//! - ParquetScanIterator per file
-//!   Deduplication: skip duplicate user_keys; `Delete` at top = skip key.
+//! Collect sorted rows from every memtable and every live Parquet file,
+//! then do a single-pass dedup by user_key (PK ASC, seq DESC). A tombstone
+//! at the top of a user_key group drops the key. File-level DVs filter
+//! physically-deleted rows before dedup.
 
+use std::{path::Path, sync::Arc};
+
+use bytes::Bytes;
+use merutable_iceberg::{version::DataFileMeta, DeletionVector};
 use merutable_memtable::iterator::MemEntry;
+use merutable_parquet::reader::ParquetReader;
 use merutable_types::{
     key::InternalKey,
+    level::Level,
+    schema::TableSchema,
     sequence::OpType,
     value::{FieldValue, Row},
-    Result,
+    MeruError, Result,
 };
+use roaring::RoaringBitmap;
 
 use crate::engine::MeruEngine;
+
+// ── File open helper ────────────────────────────────────────────────────────
+
+/// Synchronously open a Parquet file from disk and, when the manifest
+/// records a Deletion Vector, load the exact DV blob byte range from the
+/// companion Puffin file.
+///
+/// The returned `RoaringBitmap` is the set of **file-global** row positions
+/// that were logically deleted by a subsequent partial compaction. Readers
+/// MUST pass it to `ParquetReader::get`/`scan` or else deleted rows will
+/// silently resurrect on read.
+fn open_file(
+    base: &Path,
+    file: &DataFileMeta,
+    schema: Arc<TableSchema>,
+) -> Result<(ParquetReader<Bytes>, Option<RoaringBitmap>)> {
+    let abs_parquet = base.join(&file.path);
+    let parquet_bytes = std::fs::read(&abs_parquet).map_err(MeruError::Io)?;
+    let reader = ParquetReader::open(Bytes::from(parquet_bytes), schema)?;
+
+    let dv = match (&file.dv_path, file.dv_offset, file.dv_length) {
+        (Some(dv_path), Some(offset), Some(length)) => {
+            let abs_dv = base.join(dv_path);
+            let puffin_bytes = std::fs::read(&abs_dv).map_err(MeruError::Io)?;
+            let start = offset as usize;
+            let end = start
+                .checked_add(length as usize)
+                .ok_or_else(|| MeruError::Corruption("DV offset+length overflow".into()))?;
+            if end > puffin_bytes.len() {
+                return Err(MeruError::Corruption(format!(
+                    "DV blob out of range: path={dv_path} offset={offset} length={length} puffin_len={}",
+                    puffin_bytes.len()
+                )));
+            }
+            let dv = DeletionVector::from_puffin_blob(&puffin_bytes[start..end])?;
+            Some(dv.bitmap().clone())
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(MeruError::Corruption(format!(
+                "inconsistent DV coords on file {}: dv_path={:?} dv_offset={:?} dv_length={:?}",
+                file.path, file.dv_path, file.dv_offset, file.dv_length
+            )));
+        }
+    };
+
+    Ok((reader, dv))
+}
 
 // ── Point lookup ─────────────────────────────────────────────────────────────
 
@@ -34,10 +94,10 @@ pub fn point_lookup(engine: &MeruEngine, pk_values: &[FieldValue]) -> Result<Opt
 
     // Encode user key bytes for the lookup.
     let ikey = InternalKey::encode(pk_values, read_seq, OpType::Put, &engine.schema)?;
-    let user_key_bytes = ikey.user_key_bytes();
+    let user_key_bytes = ikey.user_key_bytes().to_vec();
 
     // Stop 1: Memtable.
-    if let Some(entry) = engine.memtable.get(user_key_bytes, read_seq) {
+    if let Some(entry) = engine.memtable.get(&user_key_bytes, read_seq) {
         if entry.op_type == OpType::Delete {
             return Ok(None); // tombstone
         }
@@ -50,24 +110,58 @@ pub fn point_lookup(engine: &MeruEngine, pk_values: &[FieldValue]) -> Result<Opt
         return Ok(Some(row));
     }
 
-    // Get current version for file lookups.
-    let _version = engine.version_set.current();
+    let version = engine.version_set.current();
+    let base = engine.catalog.base_path();
 
-    // Stop 2: L0 files (check all, sorted by seq_max DESC = newest first).
-    // In the current Phase 4 implementation, ParquetReader requires a Read+Seek
-    // source. For files on disk, we'd open them. For now (placeholder files),
-    // we skip the file lookup.
-    // TODO: Wire up ParquetReader for real file reads in Phase 7 completion.
+    // Stop 2: L0 files. `Manifest::to_version` pre-sorts L0 by `seq_max`
+    // DESC so the first file that returns a hit is guaranteed to carry the
+    // newest visible version of `user_key_bytes`.
+    for file in version.files_at(Level(0)) {
+        if !range_contains(&file.meta.key_min, &file.meta.key_max, &user_key_bytes) {
+            continue;
+        }
+        let (reader, dv) = open_file(base, file, engine.schema.clone())?;
+        if let Some((hit_ikey, row)) = reader.get(&user_key_bytes, read_seq, dv.as_ref())? {
+            if hit_ikey.op_type == OpType::Delete {
+                return Ok(None);
+            }
+            return Ok(Some(row));
+        }
+    }
 
-    // Stop 3: L1..LN (binary search per level).
-    // Same limitation as Stop 2 — deferred to full Phase 7.
+    // Stop 3: L1..LN — binary search for the covering file per level.
+    let max_level = version.max_level();
+    for lvl in 1..=max_level.0 {
+        let level = Level(lvl);
+        let Some(file) = version.find_file_for_key(level, &user_key_bytes) else {
+            continue;
+        };
+        let (reader, dv) = open_file(base, file, engine.schema.clone())?;
+        if let Some((hit_ikey, row)) = reader.get(&user_key_bytes, read_seq, dv.as_ref())? {
+            if hit_ikey.op_type == OpType::Delete {
+                return Ok(None);
+            }
+            return Ok(Some(row));
+        }
+    }
 
     Ok(None)
 }
 
+fn range_contains(key_min: &[u8], key_max: &[u8], probe: &[u8]) -> bool {
+    if !key_min.is_empty() && probe < key_min {
+        return false;
+    }
+    if !key_max.is_empty() && probe > key_max {
+        return false;
+    }
+    true
+}
+
 // ── Range scan ───────────────────────────────────────────────────────────────
 
-/// Range scan with K-way merge.
+/// Range scan with K-way merge across memtables and every live Parquet file.
+/// Dedups by `user_key`, drops tombstones, and honors Deletion Vectors.
 pub fn range_scan(
     engine: &MeruEngine,
     start_pk: Option<&[FieldValue]>,
@@ -89,72 +183,107 @@ pub fn range_scan(
         })
         .transpose()?;
 
-    // Collect memtable entries.
+    // Harvest every candidate `(InternalKey, Row, op_type)` tuple into a
+    // single buffer. We do a single sort+dedup pass at the end rather than
+    // an incremental k-way merge: simpler to get right, still O(N log N),
+    // and N is bounded by the active working set.
+    let mut harvest: Vec<(InternalKey, Row, OpType)> = Vec::new();
+
+    // 1. Memtable snapshots.
     let mem_snapshots = engine.memtable.snapshot_entries(read_seq);
-
-    // Merge all memtable entries into a single sorted stream.
-    // Since each snapshot is already sorted and deduplicated within its
-    // memtable, we do a K-way merge across all memtable snapshots.
-    let mut all_entries: Vec<MemEntry> = Vec::new();
-    for snapshot in mem_snapshots {
-        all_entries.extend(snapshot);
+    let mut mem_all: Vec<MemEntry> = Vec::new();
+    for s in mem_snapshots {
+        mem_all.extend(s);
     }
-
-    // Deduplicate: keep only the entry with highest seq for each user_key.
-    // Sort by (user_key ASC, seq DESC).
-    all_entries.sort_by(|a, b| a.user_key.cmp(&b.user_key).then(b.seq.cmp(&a.seq)));
-
-    let mut results: Vec<(InternalKey, Row)> = Vec::new();
-    let mut last_uk: Option<Vec<u8>> = None;
-
-    for entry in &all_entries {
-        let uk = entry.user_key.to_vec();
-
-        // Range filter.
+    for entry in &mem_all {
+        // Range gate — skip rows outside the requested range early.
+        let uk = entry.user_key.as_ref();
         if let Some(ref start) = start_bytes {
-            if uk.as_slice() < start.as_slice() {
+            if uk < start.as_slice() {
                 continue;
             }
         }
         if let Some(ref end) = end_bytes {
-            if uk.as_slice() >= end.as_slice() {
-                break;
-            }
-        }
-
-        // Dedup: skip older versions of same user_key.
-        if let Some(ref last) = last_uk {
-            if *last == uk {
+            if uk >= end.as_slice() {
                 continue;
             }
         }
-        last_uk = Some(uk.clone());
 
-        // Skip deletes.
-        if entry.entry.op_type == OpType::Delete {
-            continue;
-        }
-
-        // Reconstruct InternalKey.
+        // Rebuild the InternalKey from wire bytes (user_key ++ tag).
         let tag = (merutable_types::sequence::SEQNUM_MAX.0 - entry.seq.0) << 8
             | (entry.entry.op_type as u64);
         let mut wire = Vec::with_capacity(uk.len() + 8);
-        wire.extend_from_slice(&uk);
+        wire.extend_from_slice(uk);
         wire.extend_from_slice(&tag.to_be_bytes());
         let ikey = InternalKey::decode(&wire, &engine.schema)?;
 
-        // Deserialize row.
-        let row: Row = if entry.entry.value.is_empty() {
-            Row::default()
-        } else {
+        let row: Row = if entry.entry.op_type == OpType::Put && !entry.entry.value.is_empty() {
             serde_json::from_slice(&entry.entry.value).unwrap_or_default()
+        } else {
+            Row::default()
         };
-
-        results.push((ikey, row));
+        harvest.push((ikey, row, entry.entry.op_type));
     }
 
-    // TODO: merge with L0/L1+ Parquet file entries when ParquetReader
-    // is fully wired up (Phase 7 completion).
+    // 2. Every live Parquet file at every level.
+    let version = engine.version_set.current();
+    let base = engine.catalog.base_path();
+    let max_level = version.max_level();
+    for lvl in 0..=max_level.0 {
+        let level = Level(lvl);
+        for file in version.files_at(level) {
+            // Skip files whose key range doesn't overlap the scan range.
+            if let Some(ref start) = start_bytes {
+                if !file.meta.key_max.is_empty() && file.meta.key_max.as_slice() < start.as_slice()
+                {
+                    continue;
+                }
+            }
+            if let Some(ref end) = end_bytes {
+                if !file.meta.key_min.is_empty() && file.meta.key_min.as_slice() >= end.as_slice() {
+                    continue;
+                }
+            }
+
+            let (reader, dv) = open_file(base, file, engine.schema.clone())?;
+            // Ask the reader for rows in the requested range, already
+            // DV-filtered and MVCC-gated at `read_seq`. `scan` dedups
+            // within a single file; cross-file dedup happens below.
+            let file_rows = reader.scan(
+                start_bytes.as_deref(),
+                end_bytes.as_deref(),
+                read_seq,
+                dv.as_ref(),
+            )?;
+            for (ikey, row) in file_rows {
+                let op = ikey.op_type;
+                harvest.push((ikey, row, op));
+            }
+        }
+    }
+
+    // 3. Global sort: (user_key ASC, seq DESC).
+    harvest.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // 4. Dedup: for each user_key, keep the topmost entry (highest seq).
+    // Drop keys whose topmost entry is a tombstone.
+    let mut results: Vec<(InternalKey, Row)> = Vec::new();
+    let mut last_uk: Option<Vec<u8>> = None;
+
+    for (ikey, row, op) in harvest {
+        let uk = ikey.user_key_bytes().to_vec();
+        if let Some(ref last) = last_uk {
+            if *last == uk {
+                continue; // older version of same key
+            }
+        }
+        last_uk = Some(uk);
+
+        if op == OpType::Delete {
+            continue;
+        }
+        results.push((ikey, row));
+    }
 
     Ok(results)
 }
