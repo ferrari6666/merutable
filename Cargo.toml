@@ -9,12 +9,14 @@ resolver = "2"
 members = [
     "crates/merutable",
     "crates/merutable-python",
+    "crates/merutable-cluster",
 ]
 # merutable-python requires Python dev headers + PyO3; exclude from
 # default `cargo test/clippy --workspace` so CI doesn't need Python.
 # Build it explicitly via `maturin develop`.
 default-members = [
     "crates/merutable",
+    "crates/merutable-cluster",
 ]
 
 [workspace.dependencies]
@@ -72,6 +74,19 @@ metrics = { version = "0.24" }
 # Python bindings
 pyo3 = { version = "0.22", features = ["extension-module"] }
 
+# Raft consensus
+openraft = { version = "0.9", features = ["serde"] }
+
+# gRPC
+tonic = { version = "0.12" }
+tonic-build = { version = "0.12" }
+
+# io_uring
+io-uring = { version = "0.7" }
+
+# Concurrent map
+dashmap = { version = "6" }
+
 # Testing
 proptest = { version = "1" }
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -81,6 +96,8 @@ tempfile  = { version = "3" }
 lto           = "thin"
 codegen-units = 1
 opt-level     = 3
+debug         = "line-tables-only"
+strip         = "none"
 
 [profile.bench]
 inherits = "release"

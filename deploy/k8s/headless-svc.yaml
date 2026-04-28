@@ -1,0 +1,20 @@
+# Headless Service: gives every pod a stable DNS name of the form
+#   merutable-<ordinal>.merutable-hl.merutable.svc.cluster.local
+# which the StatefulSet pods use to reach each other as seed peers.
+apiVersion: v1
+kind: Service
+metadata:
+  name: merutable-hl
+  namespace: merutable
+  labels:
+    app.kubernetes.io/name: merutable
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: merutable
+  ports:
+    - name: grpc
+      port: 9100
+      targetPort: 9100
+      protocol: TCP

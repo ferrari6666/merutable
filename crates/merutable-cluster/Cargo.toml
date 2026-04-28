@@ -1,0 +1,51 @@
+[package]
+name        = "merutable-cluster"
+version     = "0.1.0"
+edition     = "2021"
+description = "Distributed cluster harness for merutable: Raft consensus, per-AZ hashing, io_uring log"
+license     = "Apache-2.0"
+build       = "build.rs"
+
+[build-dependencies]
+tonic-build = "0.12"
+prost-build = { workspace = true }
+
+[dependencies]
+# The embedded engine (unchanged)
+merutable = { path = "../merutable", features = ["sql", "replica"] }
+
+# Raft consensus
+openraft = { version = "0.9", features = ["serde", "single-term-leader"] }
+
+# gRPC
+tonic = { version = "0.12" }
+prost = { workspace = true }
+
+# Concurrent data structures
+dashmap = "6"
+
+# Workspace deps
+tokio       = { workspace = true }
+futures     = { workspace = true }
+async-trait = { workspace = true }
+bytes       = { workspace = true }
+tracing     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+postcard    = { workspace = true }
+metrics     = { workspace = true }
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+arc-swap    = { workspace = true }
+lru         = { workspace = true }
+xxhash-rust = { workspace = true }
+thiserror   = { workspace = true }
+crc32fast   = { workspace = true }
+
+# io_uring (linux-only)
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc     = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["full"] }

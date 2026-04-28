@@ -1,0 +1,109 @@
+# Smoke test: exercises the gRPC surface end-to-end against merutable-0
+# via the headless Service. Uses fullstorydev/grpcurl; the proto is
+# supplied via a ConfigMap named `merutable-proto` that deploy.sh
+# creates from crates/merutable-cluster/proto/cluster.proto.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: merutable-smoke
+  namespace: merutable
+  labels:
+    app.kubernetes.io/name: merutable
+    app.kubernetes.io/component: smoke
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: merutable
+        app.kubernetes.io/component: smoke
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: smoke
+          # Use the -alpine variant — the default "v1.9.1" tag is a
+          # distroless scratch image and has no /bin/sh, which this Job
+          # needs to drive the probe loop + piped grpcurl calls.
+          image: fullstorydev/grpcurl:v1.9.1-alpine
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+
+              TARGET="merutable-0.merutable-hl.${POD_NAMESPACE}.svc.cluster.local:9100"
+              PROTO_FLAGS="-import-path /proto -proto cluster.proto"
+              GRPCURL="/bin/grpcurl -plaintext $PROTO_FLAGS"
+
+              echo "==> waiting for $TARGET"
+              for i in $(seq 1 30); do
+                if $GRPCURL -d '{}' "$TARGET" merutable.cluster.MeruCluster/GetStatus >/dev/null 2>&1; then
+                  echo "node is reachable"
+                  break
+                fi
+                echo "  not ready yet (attempt $i)"; sleep 2
+              done
+
+              echo
+              echo "==> GetStatus"
+              $GRPCURL -d '{}' "$TARGET" merutable.cluster.MeruCluster/GetStatus
+
+              echo
+              echo "==> CreateTable smoke_events(id INT64 pk, payload BYTES nullable)"
+              $GRPCURL -d '{
+                "name": "smoke_events",
+                "schema": {
+                  "table_name": "smoke_events",
+                  "columns": [
+                    { "name": "id",      "col_type": "INT64",      "nullable": false },
+                    { "name": "payload", "col_type": "BYTE_ARRAY", "nullable": true  }
+                  ],
+                  "primary_key": [0]
+                }
+              }' "$TARGET" merutable.cluster.MeruCluster/CreateTable
+
+              echo
+              echo "==> ListTables"
+              $GRPCURL -d '{}' "$TARGET" merutable.cluster.MeruCluster/ListTables
+
+              # "hello" base64-encoded; grpcurl accepts bytes as base64 strings.
+              echo
+              echo "==> Put id=1, payload='hello'"
+              PUT_RESP=$($GRPCURL -d '{
+                "table": "smoke_events",
+                "row": {
+                  "fields": [
+                    { "is_null": false, "value": { "int64": "1" } },
+                    { "is_null": false, "value": { "byte_array": "aGVsbG8=" } }
+                  ]
+                }
+              }' "$TARGET" merutable.cluster.MeruCluster/Put)
+              echo "$PUT_RESP"
+
+              # Extract raft_index for read-after-write.
+              RAFT_IDX=$(echo "$PUT_RESP" | grep -o '"raftIndex"[^,}]*' | grep -o '[0-9]*' || echo 0)
+              echo "raft_index=$RAFT_IDX"
+
+              echo
+              echo "==> Get id=1 (with min_raft_index=$RAFT_IDX)"
+              $GRPCURL -d "{
+                \"table\": \"smoke_events\",
+                \"pk_values\": [ { \"int64\": \"1\" } ],
+                \"min_raft_index\": \"$RAFT_IDX\"
+              }" "$TARGET" merutable.cluster.MeruCluster/Get
+
+              echo
+              echo "==> smoke-test PASSED"
+          volumeMounts:
+            - name: proto
+              mountPath: /proto
+              readOnly: true
+      volumes:
+        - name: proto
+          configMap:
+            name: merutable-proto

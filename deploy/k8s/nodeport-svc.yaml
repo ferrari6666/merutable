@@ -1,0 +1,25 @@
+# NodePort Service: exposes merutable-0 on the Docker Desktop host at
+# localhost:30091 so grpcurl from the host can hit the cluster.
+#
+# We pin the selector to pod ordinal 0 via the auto-injected
+# statefulset.kubernetes.io/pod-name label. This keeps writes hitting
+# the same node during a smoke test; for fan-out reads, drop the
+# pod-name label to round-robin across all three pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: merutable-client
+  namespace: merutable
+  labels:
+    app.kubernetes.io/name: merutable
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: merutable
+    statefulset.kubernetes.io/pod-name: merutable-0
+  ports:
+    - name: grpc
+      port: 9100
+      targetPort: 9100
+      nodePort: 30091
+      protocol: TCP

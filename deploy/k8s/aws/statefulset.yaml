@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: merutable
+  namespace: merutable
+  labels:
+    app.kubernetes.io/name: merutable
+spec:
+  serviceName: merutable-hl
+  replicas: 3
+  # Parallel: all pods must be reachable at once for the metadata Raft
+  # bootstrap to complete. OrderedReady would deadlock on peer-1.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: merutable
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: merutable
+    spec:
+      terminationGracePeriodSeconds: 10
+      # Only schedule onto the merutable nodepool.
+      nodeSelector:
+        nodepool: merutable
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: merutable
+          effect: NoSchedule
+      # Spread pods across AZs — at most one per zone.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: merutable
+      # Containerd's default seccomp profile returns ENOSYS for
+      # io_uring_*, which aborts uring_log.rs at startup. Unconfined
+      # is acceptable here; the pod is not exposed publicly.
+      securityContext:
+        seccompProfile:
+          type: Unconfined
+        fsGroup: 10001
+      initContainers:
+        # Dockerfile runs as UID 10001 (user `merutable`). The NVMe hostPath
+        # `/data/merutable/0` is root-owned from user-data, so chown it once
+        # at pod start so the runtime container can write its Raft log + WAL.
+        - name: chown-data
+          # Mirrored into private ECR because this VPC can't reach docker.io
+          # or public.ecr.aws (HTTP proxy intercepts HTTPS).
+          image: 240852588578.dkr.ecr.us-west-2.amazonaws.com/busybox:1.36
+          command: ["sh", "-c", "chown -R 10001:10001 /data && chmod 0750 /data"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+      containers:
+        - name: merutable-node
+          image: 240852588578.dkr.ecr.us-west-2.amazonaws.com/merutable-node:latest
+          imagePullPolicy: Always
+          ports:
+            - name: grpc
+              containerPort: 9100
+              protocol: TCP
+            - name: metrics
+              containerPort: 9101
+              protocol: TCP
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_ZONE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['topology.kubernetes.io/zone']
+            - name: RUST_LOG
+              value: info,merutable_cluster=debug
+            - name: CLUSTER_DOMAIN
+              value: "merutable-hl.$(POD_NAMESPACE).svc.cluster.local"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ORD="${HOSTNAME##*-}"
+              DOMAIN="merutable-hl.${POD_NAMESPACE}.svc.cluster.local"
+              case "$ORD" in
+                0) NID=1; AZ=AZ-1
+                   SEEDS="2:AZ-2:merutable-1.${DOMAIN}:9100 3:AZ-3:merutable-2.${DOMAIN}:9100" ;;
+                1) NID=2; AZ=AZ-2
+                   SEEDS="1:AZ-1:merutable-0.${DOMAIN}:9100 3:AZ-3:merutable-2.${DOMAIN}:9100" ;;
+                2) NID=3; AZ=AZ-3
+                   SEEDS="1:AZ-1:merutable-0.${DOMAIN}:9100 2:AZ-2:merutable-1.${DOMAIN}:9100" ;;
+                *) echo "unexpected ordinal: $ORD" >&2; exit 1 ;;
+              esac
+              echo "starting node_id=$NID az=$AZ zone=${NODE_ZONE:-unknown} seeds=$SEEDS"
+              exec /usr/local/bin/merutable-node "$NID" "$AZ" /data 9100 $SEEDS
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            tcpSocket:
+              port: 9100
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: 9100
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          # Guaranteed QoS: requests == limits. These nodes are dedicated to
+          # merutable (taint+nodeSelector -> 1 pod / i4i.2xlarge), so the pod
+          # owns the whole box minus ~2 vCPU / 16 GiB reserved for the
+          # kubelet, CNI, CloudWatch agent, and page cache.
+          resources:
+            requests:
+              cpu: "6"
+              memory: "48Gi"
+            limits:
+              cpu: "6"
+              memory: "48Gi"
+      volumes:
+        # hostPath to the NVMe mount provisioned by the ASG user-data.
+        # /data/merutable/0 is the first NVMe instance volume on i4i nodes.
+        - name: data
+          hostPath:
+            path: /data/merutable/0
+            type: Directory

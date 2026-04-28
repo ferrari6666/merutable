@@ -1,0 +1,28 @@
+# Privileged profiling sidecar for merutable pods on EKS.
+# Runs in the host PID namespace so `perf` can attach to merutable-node.
+
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    linux-perf \
+    sysstat \
+    bpftrace \
+    procps \
+    strace \
+    gdb \
+    curl \
+    ca-certificates \
+    util-linux \
+    git \
+ && rm -rf /var/lib/apt/lists/*
+
+# FlameGraph scripts — collapse stacks + render svg.
+RUN curl -sSL https://github.com/brendangregg/FlameGraph/archive/refs/heads/master.tar.gz \
+    | tar -xz -C /opt && ln -s /opt/FlameGraph-master /opt/FlameGraph
+
+ENV PATH="/opt/FlameGraph:${PATH}"
+WORKDIR /work
+
+CMD ["sleep", "infinity"]

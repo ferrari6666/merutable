@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: merutable
+  namespace: merutable
+  labels:
+    app.kubernetes.io/name: merutable
+spec:
+  serviceName: merutable-hl
+  replicas: 3
+  # Parallel: all pods start concurrently. Required because the
+  # metadata Raft bootstrapper (node_id=1) needs peers 2 and 3 to
+  # be reachable before it can initialize. OrderedReady would
+  # deadlock here.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: merutable
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: merutable
+    spec:
+      terminationGracePeriodSeconds: 10
+      # Lab-only: the default containerd seccomp profile returns ENOSYS
+      # for io_uring_* syscalls, which makes `uring_log.rs` abort with
+      # `Os { code: 38, kind: Unsupported }` at startup. Unconfined is
+      # acceptable here because this manifest is scoped to Docker Desktop
+      # / kind and the pod is not exposed beyond cluster-local.
+      securityContext:
+        seccompProfile:
+          type: Unconfined
+      containers:
+        - name: merutable-node
+          image: merutable-node:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 9100
+              protocol: TCP
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RUST_LOG
+              value: info,merutable_cluster=debug
+            # §13.3 Divergence 3 fix: bin/merutable-node reads CLUSTER_DOMAIN +
+            # HOSTNAME to build the self-advertised address. Without this, peers
+            # see 0.0.0.0:<port> and can't dial back.
+            - name: CLUSTER_DOMAIN
+              value: "merutable-hl.$(POD_NAMESPACE).svc.cluster.local"
+          # Override the image ENTRYPOINT so we can derive node_id/az
+          # and the seed-peer list from the pod ordinal at runtime.
+          # The binary signature is:
+          #   merutable-node <node_id> <az> <data_dir> <grpc_port> [<peer_id>:<az>:<addr> ...]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ORD="${HOSTNAME##*-}"
+              DOMAIN="merutable-hl.${POD_NAMESPACE}.svc.cluster.local"
+              case "$ORD" in
+                0) NID=1; AZ=AZ-1
+                   SEEDS="2:AZ-2:merutable-1.${DOMAIN}:9100 3:AZ-3:merutable-2.${DOMAIN}:9100" ;;
+                1) NID=2; AZ=AZ-2
+                   SEEDS="1:AZ-1:merutable-0.${DOMAIN}:9100 3:AZ-3:merutable-2.${DOMAIN}:9100" ;;
+                2) NID=3; AZ=AZ-3
+                   SEEDS="1:AZ-1:merutable-0.${DOMAIN}:9100 2:AZ-2:merutable-1.${DOMAIN}:9100" ;;
+                *) echo "unexpected ordinal: $ORD" >&2; exit 1 ;;
+              esac
+              echo "starting node_id=$NID az=$AZ seeds=$SEEDS"
+              exec /usr/local/bin/merutable-node "$NID" "$AZ" /data 9100 $SEEDS
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            tcpSocket:
+              port: 9100
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            failureThreshold: 5
+          livenessProbe:
+            tcpSocket:
+              port: 9100
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+      volumes:
+        # emptyDir: per-pod scratch, wiped on pod restart / reschedule.
+        # Suitable for the lab; swap to a volumeClaimTemplate for
+        # anything resembling persistence.
+        - name: data
+          emptyDir: {}

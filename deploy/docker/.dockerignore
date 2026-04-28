@@ -1,0 +1,16 @@
+target/
+**/target/
+.git/
+.github/
+.idea/
+.vscode/
+.venv/
+lab/.venv/
+lab/**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+**/mutants.out*/
+deploy/
+docs/
+*.md
+!crates/merutable/README.md

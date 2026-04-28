@@ -1,0 +1,93 @@
+syntax = "proto3";
+package merutable.raft_transport;
+
+// --- Batched Raft transport ---
+//
+// All Raft groups' messages destined for the same peer node are
+// batched into a single gRPC call. This collapses N heartbeats
+// (one per table Raft group) into one RPC. Data-bearing
+// AppendEntries are flushed immediately; heartbeats batch on a
+// 100ms timer.
+
+message BatchRaftMessage {
+    uint64 from_node = 1;
+    repeated GroupMessage messages = 2;
+}
+
+message BatchRaftResponse {
+    repeated GroupMessage responses = 1;
+}
+
+message GroupMessage {
+    string group_id = 1;
+    oneof payload {
+        AppendEntriesRequest append_request = 2;
+        AppendEntriesResponse append_response = 3;
+        VoteRequest vote_request = 4;
+        VoteResponse vote_response = 5;
+        InstallSnapshotRequest install_snapshot_request = 6;
+        InstallSnapshotResponse install_snapshot_response = 7;
+    }
+}
+
+// --- Raft RPCs (per openraft wire format) ---
+
+message LogId {
+    uint64 term = 1;
+    uint64 index = 2;
+    uint64 node_id = 3;
+}
+
+message Vote {
+    uint64 term = 1;
+    uint64 node_id = 2;
+    bool committed = 3;
+}
+
+message RaftEntry {
+    LogId log_id = 1;
+    bytes payload = 2;  // serialized RaftCommand (postcard)
+}
+
+message AppendEntriesRequest {
+    Vote vote = 1;
+    optional LogId prev_log_id = 2;
+    repeated RaftEntry entries = 3;
+    optional LogId leader_commit = 4;
+}
+
+message AppendEntriesResponse {
+    Vote vote = 1;
+    bool success = 2;
+    optional LogId conflict = 3;
+}
+
+message VoteRequest {
+    Vote vote = 1;
+    optional LogId last_log_id = 2;
+}
+
+message VoteResponse {
+    Vote vote = 1;
+    bool vote_granted = 2;
+    optional LogId last_log_id = 3;
+}
+
+message InstallSnapshotRequest {
+    Vote vote = 1;
+    LogId last_included = 2;
+    uint64 offset = 3;
+    bytes data = 4;
+    bool done = 5;
+}
+
+message InstallSnapshotResponse {
+    Vote vote = 1;
+}
+
+// --- The transport service ---
+
+service RaftTransport {
+    // Single RPC for all Raft groups between two nodes
+    rpc Batch(BatchRaftMessage) returns (BatchRaftResponse);
+}
